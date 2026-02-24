@@ -11,7 +11,7 @@
 #define GPIO_PA5PIN_IDR	(*((volatile unsigned int*)(GPIO_PA5PIN_BASE+0x00000010UL)))
 #define GPIO_PA5PIN_ODR	(*((volatile unsigned int*)(GPIO_PA5PIN_BASE+0x00000014UL)))
 	
-void delay();
+void delay(unsigned int delay_cnt);
 
 
 int main(void)
@@ -38,18 +38,18 @@ int main(void)
 
     while (1)
     {
-			*((unsigned int*)(0x50000000U + 0x00000014U)) = (unsigned int)0x20;
-			delay();
-			*((unsigned int*)(0x50000000U + 0x00000014U)) = (unsigned int)0x00;
-			delay();
+			GPIO_PA5PIN_ODR = (unsigned char)0x20;
+			delay(0x200000);
+			GPIO_PA5PIN_ODR = (unsigned char)0x00;
+			delay(0x200000);
 		}
 }
 
 
-void delay(){
-	int volatile counter = 0;
+void delay(unsigned int delay_cnt){
+	volatile int counter = 0;
 	
-	while(counter < 100000) // delay loop
+	while(counter < delay_cnt) // delay loop
 	{
 		counter++;
 	}
