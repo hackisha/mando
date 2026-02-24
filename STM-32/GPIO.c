@@ -3,10 +3,13 @@
 #define RCC_BASE					(AHBPERIPH_BASE + 0x00001000UL)
 #define RCC_IOPENR				*((volatile unsigned int*)(RCC_BASE + 0x0000002CUL))
 #define RCC_GPIOA_EN 			(unsigned int)0x00000001U
+#define RCC_GPIOB_EN 			(unsigned int)0x00000002U
 
 
 #define GPIOA_BASE				((unsigned int)0x50000000UL)
 #define GPIOA							(GPIO_TypeDef*) GPIOA_BASE
+#define GPIOB_BASE				((unsigned int)0x50000400UL)
+#define GPIOB							(GPIO_TypeDef*) GPIOB_BASE
 #define GPIO_PA5PIN_BASE	(unsigned int)0x50000000U
 #define GPIO_PA5PIN_MODE	(*((volatile unsigned int*)GPIO_PA5PIN_BASE))
 #define GPIO_PA5PIN_OTYPE	(*((volatile unsigned int*)(GPIO_PA5PIN_BASE+0x00000004UL)))
@@ -65,7 +68,7 @@ int main(void)
 	GPIO_PinState pin_state = GPIO_PIN_RESET;
 	
 	//RCC-GPIOA
-	RCC_IOPENR |= RCC_GPIOA_EN;
+	RCC_IOPENR |= (RCC_GPIOA_EN | RCC_GPIOB_EN);
 	initVal.MODER = GPIO_MODE_OUTPUT;
 	initVal.OTYPER = GPIO_OUTPUT_TYPE_0;
 	initVal.OSPEEDR = GPIO_SPEED_FREQ_VERY_HIGH;
@@ -73,13 +76,18 @@ int main(void)
 	
 	GPIO_Init(GPIOA, GPIO_PIN_5_POS, &initVal);
 	GPIO_Init(GPIOA, GPIO_PIN_8_POS, &initVal);
+	GPIO_Init(GPIOB, GPIO_PIN_5_POS, &initVal);
+	
 	GPIO_Write_Pin(GPIOA, GPIO_PIN_5_POS, pin_state);
 	GPIO_Write_Pin(GPIOA, GPIO_PIN_8_POS, pin_state);
+	GPIO_Write_Pin(GPIOB, GPIO_PIN_5_POS, pin_state);
+	
 	while (1)
 	{
 		pin_state = (GPIO_PinState)(!pin_state);
 		GPIO_Write_Pin(GPIOA, GPIO_PIN_5_POS, pin_state);
 		GPIO_Write_Pin(GPIOA, GPIO_PIN_8_POS, (!pin_state));
+		GPIO_Write_Pin(GPIOB, GPIO_PIN_5_POS, pin_state);
 		delay(0x20000);
 	}
 }
