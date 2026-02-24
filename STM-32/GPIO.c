@@ -1,4 +1,18 @@
+#define PERIPH_BASE				(0x40000000UL)
+#define AHBPERIPH_BASE		(PERIPH_BASE + 0x00020000UL)
+#define RCC_BASE					(AHBPERIPH_BASE + 0x00001000UL
+#define RCC_GPIOA					*((volatile unsigned int*)(RCC_BASE + 0x0000002CUL))
+
+#define GPIO_PA5PIN_BASE	(unsigned int)0x50000000U
+#define GPIO_PA5PIN_MODE	(*((volatile unsigned int*)GPIO_PA5PIN_BASE))
+#define GPIO_PA5PIN_OTYPE	(*((volatile unsigned int*)(GPIO_PA5PIN_BASE+0x00000004UL)))
+#define GPIO_PA5PIN_OSPEEDR	(*((volatile unsigned int*)(GPIO_PA5PIN_BASE+0x00000008UL)))
+#define GPIO_PA5PIN_OPUPDR	(*((volatile unsigned int*)(GPIO_PA5PIN_BASE+0x0000000CUL)))
+#define GPIO_PA5PIN_IDR	(*((volatile unsigned int*)(GPIO_PA5PIN_BASE+0x00000010UL)))
+#define GPIO_PA5PIN_ODR	(*((volatile unsigned int*)(GPIO_PA5PIN_BASE+0x00000014UL)))
+	
 void delay();
+
 
 int main(void)
 {
