@@ -31,9 +31,6 @@
 #define LED2_OFF							((unsigned int)0x00000000U)
 	
 
-//funcs
-void delay(unsigned int delay_cnt);
-
 //Structure and Array
 
 typedef struct{
@@ -50,69 +47,99 @@ typedef struct{
 }GPIO_TypeDef;
 
 
+typedef enum{
+	GPIO_PIN_RESET = 0U,
+	GPIO_PIN_SET
+} GPIO_PinState;
+
+
+//funcs
+void delay(unsigned int delay_cnt);
+void GPIO_Init(GPIO_TypeDef *pGPIO_Type, unsigned short pin, GPIO_TypeDef *initVal);
+void GPIO_Write_Pin(GPIO_TypeDef *pGPIO_Type, unsigned short pin, GPIO_PinState state);
+
+
 int main(void)
 {
-
-	unsigned int position = GPIO_PIN_5_POS;
-	unsigned int temp = 0x00U;
-	unsigned int reg_val = 0x00U;
-	unsigned int reg = 0x00U;
-	unsigned int mode = 0x00u;
-	GPIO_TypeDef*GPIOA_reg = GPIOA;
-	
+	GPIO_TypeDef initVal;
+	GPIO_PinState pin_state = GPIO_PIN_RESET;
 	//RCC-GPIOA
 	RCC_IOPENR |= RCC_GPIOA_EN;
+	initVal.MODER = GPIO_MODE_OUTPUT;
+	initVal.OTYPER = GPIO_OUTPUT_TYPE_0;
+	initVal.OSPEEDR = GPIO_SPEED_FREQ_VERY_HIGH;
+	initVal.PUPDR = GPIO_GPIO_NOPUPD;
 	
-	
-	//PA5 Mode
-	reg = GPIOA_reg -> MODER;
-	temp = ~(GPIO_2BIT_POS_MASK << (position*2U)); //0xFFFFF3FF
-	reg &= temp;
-	mode = GPIO_MODE_OUTPUT << (position*2U);
-	reg |= mode;
-	GPIOA_reg->MODER = reg;
-	
-	//OTYPER
-	reg = GPIOA_reg->OTYPER;
-	temp = ~(GPIO_1BIT_POS_MASK << position);
-	reg &= temp;
-	mode = GPIO_OUTPUT_TYPE_0 << position;
-	reg|=mode;
-	GPIOA_reg->OTYPER = reg;
-	//OSPEEDR
-	reg = GPIOA_reg -> OSPEEDR;
-	temp = ~(GPIO_2BIT_POS_MASK << (position*2U)); //0xFFFFF3FF
-	reg &= temp;
-	mode = GPIO_SPEED_FREQ_VERY_HIGH << (position*2U); //very high mode - 2bit 0x00000C00
-	reg |= mode;
-	GPIOA_reg->OSPEEDR = reg;
-	//OPUPDR
-	reg = GPIOA_reg->PUPDR;
-	temp = ~(0x03U << (position*2U)); //0xFFFFF3FF
-	reg &= temp;
-	mode = 0x0U << (position*2U);
-	reg|=mode;
-	GPIOA_reg->PUPDR = reg;
-	
-	//ODR
-	reg = GPIOA_reg->ODR; //GPIO_PA5pin_odr
-	temp = ~(GPIO_1BIT_POS_MASK << position);
-	reg &= temp;
-	mode = LED2_ON << position;
-	GPIOA_reg->ODR = reg | mode;
+	GPIO_Init(GPIOA, GPIO_PIN_5_POS, &initVal);
+	GPIO_Write_Pin(GPIOA, GPIO_PIN_5_POS, pin_state);
 	
 	while (1)
 	{
 		delay(0x20000);
-		mode = ~mode&(GPIO_1BIT_POS_MASK << position);
-		GPIOA_reg->ODR = reg|mode;
+		pin_state = (GPIO_PinState)(!pin_state);
+		GPIO_Write_Pin(GPIOA, GPIO_PIN_5_POS, pin_state);
 	}
 }
 
+
+/*=================================functions================================*/
 void delay(unsigned int delay_cnt){
 	volatile int counter = 0;
 	while(counter < delay_cnt)
 	{
 		counter++;
 	}
+}
+
+void GPIO_Write_Pin(GPIO_TypeDef *pGPIO_Type, unsigned short pin, GPIO_PinState state){
+	unsigned int temp = 0x00U;
+	unsigned int reg = 0x00U;
+	unsigned int mode = 0x00u;
+	//ODR
+	reg = pGPIO_Type->ODR;
+	temp = ~(GPIO_1BIT_POS_MASK << pin);
+	reg &= temp;
+	mode = state << pin;
+	pGPIO_Type->ODR = reg|mode;
+}
+
+void GPIO_Init(GPIO_TypeDef *pGPIO_Type, unsigned short pin, GPIO_TypeDef *initVal){
+
+	unsigned int position = pin;
+	unsigned int temp = 0x00U;
+	unsigned int reg = 0x00U;
+	unsigned int mode = 0x00u;
+	
+	//PA5 Mode
+	reg = pGPIO_Type -> MODER;
+	temp = ~(GPIO_2BIT_POS_MASK << (position*2U)); //0xFFFFF3FF
+	reg &= temp;
+	mode = GPIO_MODE_OUTPUT << (position*2U);
+	reg |= mode;
+	pGPIO_Type->MODER = reg;
+	
+	//OTYPER
+	reg = pGPIO_Type->OTYPER;
+	temp = ~(GPIO_1BIT_POS_MASK << position);
+	reg &= temp;
+	mode = GPIO_OUTPUT_TYPE_0 << position;
+	reg|=mode;
+	pGPIO_Type->OTYPER = reg;
+	
+	//OSPEEDR
+	reg = pGPIO_Type->OSPEEDR;
+	temp = ~(GPIO_2BIT_POS_MASK << (position*2U)); //0xFFFFF3FF
+	reg &= temp;
+	mode = GPIO_SPEED_FREQ_VERY_HIGH << (position*2U); //very high mode - 2bit 0x00000C00
+	reg |= mode;
+	pGPIO_Type->OSPEEDR = reg;
+	
+	//OPUPDR
+	reg = pGPIO_Type->PUPDR;
+	temp = ~(0x03U << (position*2U)); //0xFFFFF3FF
+	reg &= temp;
+	mode = 0x0U << (position*2U);
+	reg|=mode;
+	pGPIO_Type->PUPDR = reg;
+	
 }
