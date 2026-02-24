@@ -63,6 +63,7 @@ int main(void)
 {
 	GPIO_TypeDef initVal;
 	GPIO_PinState pin_state = GPIO_PIN_RESET;
+	
 	//RCC-GPIOA
 	RCC_IOPENR |= RCC_GPIOA_EN;
 	initVal.MODER = GPIO_MODE_OUTPUT;
@@ -71,13 +72,15 @@ int main(void)
 	initVal.PUPDR = GPIO_GPIO_NOPUPD;
 	
 	GPIO_Init(GPIOA, GPIO_PIN_5_POS, &initVal);
+	GPIO_Init(GPIOA, GPIO_PIN_8_POS, &initVal);
 	GPIO_Write_Pin(GPIOA, GPIO_PIN_5_POS, pin_state);
-	
+	GPIO_Write_Pin(GPIOA, GPIO_PIN_8_POS, pin_state);
 	while (1)
 	{
-		delay(0x20000);
 		pin_state = (GPIO_PinState)(!pin_state);
 		GPIO_Write_Pin(GPIOA, GPIO_PIN_5_POS, pin_state);
+		GPIO_Write_Pin(GPIOA, GPIO_PIN_8_POS, (!pin_state));
+		delay(0x20000);
 	}
 }
 
