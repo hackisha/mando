@@ -1,0 +1,369 @@
+/*@!Encoding:65001*/
+includes { }
+
+variables
+{
+  message Fault_sts_Rsp Fault_sts_Rsp_msg; // ID: 0x556
+  message Fault_sts_Req Fault_sts_Req_msg; // ID: 0x555
+}
+
+on message Fault_sts_Rsp
+{
+  Fault_sts_Rsp_msg = this;
+}
+
+// -----------------------------------------------------------------
+// Helper Functions
+// -----------------------------------------------------------------
+
+void setupPreCondition(long engineSts, long ignitionSts, long battPercent)
+{
+  // Enable required nodes
+  @sysvar::ENG::Sys_ENG_10ms_En = 1;
+  @sysvar::ENG::Sys_IGN_2ms_En = 1;
+  @sysvar::BMS::Sys_BMS_10ms_En = 1;
+  
+  // Disable other nodes
+  @sysvar::STR::Sys_STR_10ms_En = 0;
+  @sysvar::BRK::Sys_BRK_10ms_En = 0;
+
+  @sysvar::ENG::Sys_Engine_sts = engineSts;
+  @sysvar::ENG::Sys_Ignition_sts = ignitionSts;
+  @sysvar::BMS::Sys_Batt_Percent = battPercent;
+
+  // Reset request
+  Fault_sts_Req_msg.All_Fault_clr_request = 0;
+  Fault_sts_Req_msg.All_Fault_sts_request = 0;
+  output(Fault_sts_Req_msg);
+
+  testWaitForTimeout(100);
+}
+
+void setBattPercent(long battPercent)
+{
+  @sysvar::BMS::Sys_Batt_Percent = battPercent;
+}
+
+int requestFaultStatus(long timeoutMs)
+{
+  Fault_sts_Req_msg.All_Fault_sts_request = 1;
+  output(Fault_sts_Req_msg);
+
+  if (testWaitForMessage(Fault_sts_Rsp, timeoutMs))
+  {
+    // Clear request immediately for 10ms rule
+    Fault_sts_Req_msg.All_Fault_sts_request = 0;
+    output(Fault_sts_Req_msg);
+    return 1;
+  }
+
+  Fault_sts_Req_msg.All_Fault_sts_request = 0;
+  output(Fault_sts_Req_msg);
+  return 0;
+}
+
+void clearAllFault()
+{
+  Fault_sts_Req_msg.All_Fault_sts_request = 0;
+  Fault_sts_Req_msg.All_Fault_clr_request = 1;
+  output(Fault_sts_Req_msg);
+  testWaitForTimeout(50);
+
+  Fault_sts_Req_msg.All_Fault_clr_request = 0;
+  output(Fault_sts_Req_msg);
+  testWaitForTimeout(50);
+}
+
+int clearAndVerifyNoFault(char stepId[])
+{
+  clearAllFault();
+
+  if (!requestFaultStatus(100))
+  {
+    testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout");
+    return 0;
+  }
+
+  if (Fault_sts_Rsp_msg.BATT_Percent_Err_sts != 0)
+  {
+    testStepFail(stepId, "Fail. Expected: 0, Actual: %d", Fault_sts_Rsp_msg.BATT_Percent_Err_sts);
+    return 0;
+  }
+
+  testStepPass(stepId, "Pass. Expected: 0, Actual: 0");
+  return 1;
+}
+
+int verifyCurrentPercentStatus(char stepId[], long expected)
+{
+  testWaitForTimeout(20); // Gap for 10ms rule
+
+  if (!requestFaultStatus(100))
+  {
+    testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout");
+    return 0;
+  }
+
+  if (Fault_sts_Rsp_msg.BATT_Percent_Err_sts != expected)
+  {
+    testStepFail(stepId, "Fail. Expected: %d, Actual: %d", expected, Fault_sts_Rsp_msg.BATT_Percent_Err_sts);
+    return 0;
+  }
+
+  testStepPass(stepId, "Pass. Expected: %d, Actual: %d", expected, Fault_sts_Rsp_msg.BATT_Percent_Err_sts);
+  return 1;
+}
+
+long measureTimeAfterPercentChange(long battPercent, long targetStatus, long maxWaitMs, long pollMs)
+{
+  dword startTime;
+  dword currentTime;
+  long elapsed;
+
+  startTime = timeNow();
+  setBattPercent(battPercent);
+
+  while (1)
+  {
+    testWaitForTimeout(pollMs); // Gap for 10ms rule
+    
+    currentTime = timeNow();
+    elapsed = (currentTime - startTime) / 100;
+
+    if (elapsed > maxWaitMs) break;
+
+    if (requestFaultStatus(50))
+    {
+      if (Fault_sts_Rsp_msg.BATT_Percent_Err_sts == targetStatus)
+      {
+        currentTime = timeNow();
+        return (currentTime - startTime) / 100;
+      }
+    }
+  }
+  return -1;
+}
+
+int checkTimeLimit(char stepId[], long measuredMs, long minMs, long maxMs)
+{
+  if (measuredMs < 0)
+  {
+    testStepFail(stepId, "Fail. Expected: Change within %d ms, Actual: Timeout", maxMs);
+    return 0;
+  }
+
+  if (measuredMs < minMs || measuredMs > maxMs)
+  {
+    testStepFail(stepId, "Fail. Expected: %d ~ %d ms, Actual: %d ms", minMs, maxMs, measuredMs);
+    return 0;
+  }
+
+  testStepPass(stepId, "Pass. Expected: %d ~ %d ms, Actual: %d ms", minMs, maxMs, measuredMs);
+  return 1;
+}
+
+int checkStatusNotChangedAtTime(char stepId[], long waitMs, long unexpectedStatus)
+{
+  testWaitForTimeout(20); // Gap for 10ms rule
+  testWaitForTimeout(waitMs);
+
+  if (!requestFaultStatus(100))
+  {
+    testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout");
+    return 0;
+  }
+
+  if (Fault_sts_Rsp_msg.BATT_Percent_Err_sts == unexpectedStatus)
+  {
+    testStepFail(stepId, "Fail. Expected: NOT %d yet, Actual: %d at %d ms", unexpectedStatus, unexpectedStatus, waitMs);
+    return 0;
+  }
+
+  testStepPass(stepId, "Pass. Expected: NOT %d yet, Actual: %d at %d ms", unexpectedStatus, Fault_sts_Rsp_msg.BATT_Percent_Err_sts, waitMs);
+  return 1;
+}
+
+int checkNoFaultForDuration(char stepId[], long totalWaitMs, long pollMs)
+{
+  dword startTime;
+  dword currentTime;
+  long elapsed;
+
+  testWaitForTimeout(20); // Gap for 10ms rule
+  startTime = timeNow();
+
+  while (1)
+  {
+    currentTime = timeNow();
+    elapsed = (currentTime - startTime) / 100;
+
+    if (elapsed > totalWaitMs) break;
+
+    if (!requestFaultStatus(100))
+    {
+      testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout at %d ms", elapsed);
+      return 0;
+    }
+
+    if (Fault_sts_Rsp_msg.BATT_Percent_Err_sts == 2)
+    {
+      testStepFail(stepId, "Fail. Expected: 0, Actual: 2 (Fault detected early at %d ms)", elapsed);
+      return 0;
+    }
+
+    testWaitForTimeout(pollMs);
+  }
+
+  testStepPass(stepId, "Pass. Expected: 0 for %d ms, Actual: 0", totalWaitMs);
+  return 1;
+}
+
+int setupAndClearFault(char clearStepId[], long engineSts, long ignitionSts, long battPercent)
+{
+  setupPreCondition(engineSts, ignitionSts, battPercent);
+
+  if (!clearAndVerifyNoFault(clearStepId)) return 0;
+  return 1;
+}
+
+// -----------------------------------------------------------------
+// Test Cases
+// -----------------------------------------------------------------
+
+testcase TC_PRE_01_NoDetection_When_EngineIsOff()
+{
+  testStep("1.0", "Setup: Engine=0, IGN=1, Batt=50%");
+  if (!setupAndClearFault("1.1", 0, 1, 50)) return;
+
+  testStep("2.0", "Check: Set Batt 15% and wait 5200 ms");
+  setBattPercent(15);
+  checkNoFaultForDuration("2.1", 5200, 20);
+}
+
+testcase TC_PRE_02_NoDetection_When_IgnitionIsOff()
+{
+  testStep("1.0", "Setup: Engine=1, IGN=0, Batt=50%");
+  if (!setupAndClearFault("1.1", 1, 0, 50)) return;
+
+  testStep("2.0", "Check: Set Batt 15% and wait 5200 ms");
+  setBattPercent(15);
+  checkNoFaultForDuration("2.1", 5200, 20);
+}
+
+testcase TC_DET_COND_01_NoFault_When_BattIs16()
+{
+  testStep("1.0", "Setup: Engine=1, IGN=1, Batt=50%");
+  if (!setupAndClearFault("1.1", 1, 1, 50)) return;
+
+  testStep("2.0", "Check: Set Batt 16% (Safe) and wait 5200 ms");
+  setBattPercent(16);
+  checkNoFaultForDuration("2.1", 5200, 20);
+}
+
+testcase TC_DET_COND_02_FaultDetected_When_BattIs15()
+{
+  testStep("1.0", "Setup: Engine=1, IGN=1, Batt=50%");
+  if (!setupAndClearFault("1.1", 1, 1, 50)) return;
+
+  testStep("2.0", "Action: Set Batt 15% (Fault) and wait 5200 ms");
+  setBattPercent(15);
+  testWaitForTimeout(5200);
+  
+  verifyCurrentPercentStatus("3.0", 2);
+}
+
+testcase TC_DET_TIM_01_NoFaultBefore4890ms_When_BattIs15()
+{
+  testStep("1.0", "Setup: Engine=1, IGN=1, Batt=50%");
+  if (!setupAndClearFault("1.1", 1, 1, 50)) return;
+
+  testStep("2.0", "Check: Wait 4890 ms (Under limit)");
+  setBattPercent(15);
+  checkStatusNotChangedAtTime("2.1", 4890, 2);
+}
+
+testcase TC_DET_TIM_02_FaultWithin4900To5100ms_When_BattIs15()
+{
+  long detectMs;
+  testStep("1.0", "Setup: Engine=1, IGN=1, Batt=50%");
+  if (!setupAndClearFault("1.1", 1, 1, 50)) return;
+
+  testStep("2.0", "Measure: Time to reach Level 2");
+  detectMs = measureTimeAfterPercentChange(15, 2, 5300, 10);
+  
+  checkTimeLimit("3.0", detectMs, 4900, 5100);
+  verifyCurrentPercentStatus("3.1", 2);
+}
+
+testcase TC_REC_COND_01_NoRecovery_When_BattIs29()
+{
+  testStep("1.0", "Action: Create Fault Level 2");
+  if (!setupAndClearFault("1.1", 1, 1, 10)) return;
+  testWaitForTimeout(5200);
+  if (!verifyCurrentPercentStatus("1.2", 2)) return;
+
+  testStep("2.0", "Check: Set Batt 29% (No recovery) and wait 120 ms");
+  setBattPercent(29);
+  testWaitForTimeout(120);
+  
+  verifyCurrentPercentStatus("2.1", 2);
+}
+
+testcase TC_REC_COND_02_Recovery_When_BattIs30()
+{
+  testStep("1.0", "Action: Create Fault Level 2");
+  if (!setupAndClearFault("1.1", 1, 1, 10)) return;
+  testWaitForTimeout(5200);
+  if (!verifyCurrentPercentStatus("1.2", 2)) return;
+
+  testStep("2.0", "Action: Set Batt 30% (Recover) and wait 120 ms");
+  setBattPercent(30);
+  testWaitForTimeout(120);
+
+  verifyCurrentPercentStatus("2.1", 1);
+}
+
+testcase TC_REC_TIM_01_NoRecoveryBefore89ms_When_BattIs30()
+{
+  testStep("1.0", "Action: Create Fault Level 2");
+  if (!setupAndClearFault("1.1", 1, 1, 10)) return;
+  testWaitForTimeout(5200);
+  if (!verifyCurrentPercentStatus("1.2", 2)) return;
+
+  testStep("2.0", "Check: Wait 89 ms (Under limit)");
+  setBattPercent(30);
+  checkStatusNotChangedAtTime("2.1", 89, 1);
+}
+
+testcase TC_REC_TIM_02_RecoveryWithin90To110ms_When_BattIs30()
+{
+  long recoverMs;
+  testStep("1.0", "Action: Create Fault Level 2");
+  if (!setupAndClearFault("1.1", 1, 1, 10)) return;
+  testWaitForTimeout(5200);
+  if (!verifyCurrentPercentStatus("1.2", 2)) return;
+
+  testStep("2.0", "Measure: Time to reach Level 1");
+  recoverMs = measureTimeAfterPercentChange(30, 1, 150, 10);
+  
+  checkTimeLimit("3.0", recoverMs, 90, 110);
+  verifyCurrentPercentStatus("3.1", 1);
+}
+
+void mainTest()
+{
+  testModuleTitle("Battery Percent Low Validation Test");
+
+  TC_PRE_01_NoDetection_When_EngineIsOff();
+  TC_PRE_02_NoDetection_When_IgnitionIsOff();
+
+  TC_DET_COND_01_NoFault_When_BattIs16();
+  TC_DET_COND_02_FaultDetected_When_BattIs15();
+  TC_DET_TIM_01_NoFaultBefore4890ms_When_BattIs15();
+  TC_DET_TIM_02_FaultWithin4900To5100ms_When_BattIs15();
+
+  TC_REC_COND_01_NoRecovery_When_BattIs29();
+  TC_REC_COND_02_Recovery_When_BattIs30();
+  TC_REC_TIM_01_NoRecoveryBefore89ms_When_BattIs30();
+  TC_REC_TIM_02_RecoveryWithin90To110ms_When_BattIs30();
+}
