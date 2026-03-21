@@ -1,0 +1,375 @@
+/*@!Encoding:65001*/
+includes { }
+
+variables
+{
+  message Fault_sts_Rsp Fault_sts_Rsp_msg;
+  message Fault_sts_Req Fault_sts_Req_msg;
+}
+
+on message Fault_sts_Rsp
+{
+  Fault_sts_Rsp_msg = this;
+}
+
+void setupPreCondition(long engineSts, long ignSts, long steeringAngle)
+{
+  @sysvar::ENG::Sys_ENG_10ms_En = 1;
+  @sysvar::ENG::Sys_IGN_2ms_En = 1;
+  @sysvar::STR::Sys_STR_10ms_En = 1;
+  @sysvar::BRK::Sys_BRK_10ms_En = 0;
+  @sysvar::BMS::Sys_BMS_10ms_En = 0;
+
+  @sysvar::ENG::Sys_Engine_sts = engineSts;
+  @sysvar::ENG::Sys_Ignition_sts = ignSts;
+  @sysvar::STR::Sys_Steering_angle = steeringAngle;
+
+  Fault_sts_Req_msg.All_Fault_clr_request = 0;
+  Fault_sts_Req_msg.All_Fault_sts_request = 0;
+  output(Fault_sts_Req_msg);
+
+  testWaitForTimeout(100);
+}
+
+void setSteeringAngle(long steeringAngle)
+{
+  @sysvar::STR::Sys_Steering_angle = steeringAngle;
+}
+
+int requestFaultStatus(long timeoutMs)
+{
+  Fault_sts_Req_msg.All_Fault_sts_request = 1;
+  output(Fault_sts_Req_msg);
+
+  if (testWaitForMessage(Fault_sts_Rsp, timeoutMs))
+  {
+    Fault_sts_Req_msg.All_Fault_sts_request = 0;
+    output(Fault_sts_Req_msg);
+    return 1;
+  }
+  Fault_sts_Req_msg.All_Fault_sts_request = 0;
+  output(Fault_sts_Req_msg);
+  return 0;
+}
+
+void clearAllFault()
+{
+  Fault_sts_Req_msg.All_Fault_sts_request = 0;
+  Fault_sts_Req_msg.All_Fault_clr_request = 1;
+  output(Fault_sts_Req_msg);
+  testWaitForTimeout(50);
+  Fault_sts_Req_msg.All_Fault_clr_request = 0;
+  output(Fault_sts_Req_msg);
+  testWaitForTimeout(50);
+}
+
+int clearAndVerifyNoFault(char stepId[])
+{
+  clearAllFault();
+  if (!requestFaultStatus(100))
+  {
+    testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout");
+    return 0;
+  }
+  if (Fault_sts_Rsp_msg.Steering_Err_sts != 0)
+  {
+    testStepFail(stepId, "Fail. Expected: 0, Actual: %d", Fault_sts_Rsp_msg.Steering_Err_sts);
+    return 0;
+  }
+  testStepPass(stepId, "Pass. Expected: 0, Actual: 0");
+  return 1;
+}
+
+int verifyCurrentStatus(char stepId[], long expected)
+{
+  testWaitForTimeout(20);
+  if (!requestFaultStatus(100))
+  {
+    testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout");
+    return 0;
+  }
+  if (Fault_sts_Rsp_msg.Steering_Err_sts != expected)
+  {
+    testStepFail(stepId, "Fail. Expected: %d, Actual: %d", expected, Fault_sts_Rsp_msg.Steering_Err_sts);
+    return 0;
+  }
+  testStepPass(stepId, "Pass. Expected: %d, Actual: %d", expected, Fault_sts_Rsp_msg.Steering_Err_sts);
+  return 1;
+}
+
+long measureTimeAfterChange(long angle, long targetStatus, long maxWaitMs, long pollMs)
+{
+  dword startTime;
+  dword currentTime;
+  long elapsed;
+
+  startTime = timeNow();
+  setSteeringAngle(angle);
+
+  while (1)
+  {
+    testWaitForTimeout(pollMs);
+    currentTime = timeNow();
+    elapsed = (currentTime - startTime) / 100;
+    if (elapsed > maxWaitMs) break;
+
+    if (requestFaultStatus(50))
+    {
+      if (Fault_sts_Rsp_msg.Steering_Err_sts == targetStatus)
+      {
+        return (timeNow() - startTime) / 100;
+      }
+    }
+  }
+  return -1;
+}
+
+int checkTimeLimit(char stepId[], long measuredMs, long minMs, long maxMs)
+{
+  if (measuredMs < 0)
+  {
+    testStepFail(stepId, "Fail. Expected: Change within %d ms, Actual: Timeout", maxMs);
+    return 0;
+  }
+  if (measuredMs < minMs || measuredMs > maxMs)
+  {
+    testStepFail(stepId, "Fail. Expected: %d ~ %d ms, Actual: %d ms", minMs, maxMs, measuredMs);
+    return 0;
+  }
+  testStepPass(stepId, "Pass. Expected: %d ~ %d ms, Actual: %d ms", minMs, maxMs, measuredMs);
+  return 1;
+}
+
+int checkStatusNotChangedAtTime(char stepId[], long waitMs, long unexpectedStatus)
+{
+  testWaitForTimeout(20);
+  testWaitForTimeout(waitMs);
+  if (!requestFaultStatus(100))
+  {
+    testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout");
+    return 0;
+  }
+  if (Fault_sts_Rsp_msg.Steering_Err_sts == unexpectedStatus)
+  {
+    testStepFail(stepId, "Fail. Expected: NOT %d yet, Actual: %d at %d ms", unexpectedStatus, unexpectedStatus, waitMs);
+    return 0;
+  }
+  testStepPass(stepId, "Pass. Expected: NOT %d yet, Actual: %d at %d ms", unexpectedStatus, Fault_sts_Rsp_msg.Steering_Err_sts, waitMs);
+  return 1;
+}
+
+int checkNoFaultForDuration(char stepId[], long totalWaitMs, long pollMs)
+{
+  dword startTime;
+  dword currentTime;
+  long elapsed;
+
+  testWaitForTimeout(20);
+  startTime = timeNow();
+
+  while (1)
+  {
+    currentTime = timeNow();
+    elapsed = (currentTime - startTime) / 100;
+    if (elapsed > totalWaitMs) break;
+
+    if (!requestFaultStatus(100))
+    {
+      testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout at %d ms", elapsed);
+      return 0;
+    }
+    if (Fault_sts_Rsp_msg.Steering_Err_sts == 2)
+    {
+      testStepFail(stepId, "Fail. Expected: 0, Actual: 2 (Fault detected early at %d ms)", elapsed);
+      return 0;
+    }
+    testWaitForTimeout(pollMs);
+  }
+  testStepPass(stepId, "Pass. Expected: 0 for %d ms, Actual: 0", totalWaitMs);
+  return 1;
+}
+
+int setupAndClearFault(char clearStepId[], long engineSts, long ignSts, long steeringAngle)
+{
+  setupPreCondition(engineSts, ignSts, steeringAngle);
+  if (!clearAndVerifyNoFault(clearStepId)) return 0;
+  return 1;
+}
+
+testcase TC_PRE_01_NoDetection_When_EngineIsOff()
+{
+  testStep("1.0", "Setup: Engine=0, IGN=1, STR=0");
+  if (!setupAndClearFault("1.1", 0, 1, 0)) return;
+  testStep("2.0", "Check: Set STR=721 and wait 70 ms");
+  setSteeringAngle(721);
+  checkNoFaultForDuration("2.1", 70, 20);
+}
+
+testcase TC_PRE_02_NoDetection_When_IgnitionIsOff()
+{
+  testStep("1.0", "Setup: Engine=1, IGN=0, STR=0");
+  if (!setupAndClearFault("1.1", 1, 0, 0)) return;
+  testStep("2.0", "Check: Set STR=721 and wait 70 ms");
+  setSteeringAngle(721);
+  checkNoFaultForDuration("2.1", 70, 20);
+}
+
+testcase TC_DET_BVA_01_NoFault_When_StrIs720()
+{
+  testStep("1.0", "Setup: Engine=1, IGN=1, STR=0");
+  if (!setupAndClearFault("1.1", 1, 1, 0)) return;
+  testStep("2.0", "Check: Set STR=720 and wait 70 ms");
+  setSteeringAngle(720);
+  checkNoFaultForDuration("2.1", 70, 20);
+}
+
+testcase TC_DET_BVA_02_NoFault_When_StrIsMinus720()
+{
+  testStep("1.0", "Setup: Engine=1, IGN=1, STR=0");
+  if (!setupAndClearFault("1.1", 1, 1, 0)) return;
+  testStep("2.0", "Check: Set STR=-720 and wait 70 ms");
+  setSteeringAngle(-720);
+  checkNoFaultForDuration("2.1", 70, 20);
+}
+
+testcase TC_DET_BVA_03_FaultDetected_When_StrIs721()
+{
+  testStep("1.0", "Setup: Engine=1, IGN=1, STR=0");
+  if (!setupAndClearFault("1.1", 1, 1, 0)) return;
+  testStep("2.0", "Action: Set STR=721 and wait 70 ms");
+  setSteeringAngle(721);
+  testWaitForTimeout(70);
+  verifyCurrentStatus("3.0", 2);
+}
+
+testcase TC_DET_BVA_04_FaultDetected_When_StrIsMinus721()
+{
+  testStep("1.0", "Setup: Engine=1, IGN=1, STR=0");
+  if (!setupAndClearFault("1.1", 1, 1, 0)) return;
+  testStep("2.0", "Action: Set STR=-721 and wait 70 ms");
+  setSteeringAngle(-721);
+  testWaitForTimeout(70);
+  verifyCurrentStatus("3.0", 2);
+}
+
+testcase TC_DET_TIM_01_NoFaultBefore39ms()
+{
+  testStep("1.0", "Setup: Engine=1, IGN=1, STR=0");
+  if (!setupAndClearFault("1.1", 1, 1, 0)) return;
+  testStep("2.0", "Check: Wait 39 ms");
+  setSteeringAngle(721);
+  checkStatusNotChangedAtTime("2.1", 39, 2);
+}
+
+testcase TC_DET_TIM_02_FaultWithin40To60ms()
+{
+  long detectMs;
+  testStep("1.0", "Setup: Engine=1, IGN=1, STR=0");
+  if (!setupAndClearFault("1.1", 1, 1, 0)) return;
+  testStep("2.0", "Measure: Time to Level 2");
+  detectMs = measureTimeAfterChange(721, 2, 80, 5);
+  checkTimeLimit("3.0", detectMs, 40, 60);
+  verifyCurrentStatus("3.1", 2);
+}
+
+testcase TC_REC_BVA_01_NoRecovery_When_StrIs721()
+{
+  testStep("1.0", "Action: Create Fault Level 2");
+  if (!setupAndClearFault("1.1", 1, 1, 0)) return;
+  setSteeringAngle(721);
+  testWaitForTimeout(70);
+  if (!verifyCurrentStatus("1.2", 2)) return;
+  testStep("2.0", "Check: Keep STR=721 and wait 120 ms");
+  setSteeringAngle(721);
+  testWaitForTimeout(120);
+  verifyCurrentStatus("2.1", 2);
+}
+
+testcase TC_REC_BVA_02_Recovery_When_StrIs720()
+{
+  testStep("1.0", "Action: Create Fault Level 2");
+  if (!setupAndClearFault("1.1", 1, 1, 0)) return;
+  setSteeringAngle(721);
+  testWaitForTimeout(70);
+  if (!verifyCurrentStatus("1.2", 2)) return;
+  testStep("2.0", "Action: Set STR=720 and wait 120 ms");
+  setSteeringAngle(720);
+  testWaitForTimeout(120);
+  verifyCurrentStatus("2.1", 1);
+}
+
+testcase TC_REC_BVA_03_NoRecovery_When_StrIsMinus721()
+{
+  testStep("1.0", "Action: Create Fault Level 2");
+  if (!setupAndClearFault("1.1", 1, 1, 0)) return;
+  setSteeringAngle(-721);
+  testWaitForTimeout(70);
+  if (!verifyCurrentStatus("1.2", 2)) return;
+  testStep("2.0", "Check: Keep STR=-721 and wait 120 ms");
+  setSteeringAngle(-721);
+  testWaitForTimeout(120);
+  verifyCurrentStatus("2.1", 2);
+}
+
+testcase TC_REC_BVA_04_Recovery_When_StrIsMinus720()
+{
+  testStep("1.0", "Action: Create Fault Level 2");
+  if (!setupAndClearFault("1.1", 1, 1, 0)) return;
+  setSteeringAngle(-721);
+  testWaitForTimeout(70);
+  if (!verifyCurrentStatus("1.2", 2)) return;
+  testStep("2.0", "Action: Set STR=-720 and wait 120 ms");
+  setSteeringAngle(-720);
+  testWaitForTimeout(120);
+  verifyCurrentStatus("2.1", 1);
+}
+
+testcase TC_REC_TIM_01_NoRecoveryBefore89ms()
+{
+  testStep("1.0", "Action: Create Fault Level 2");
+  if (!setupAndClearFault("1.1", 1, 1, 0)) return;
+  setSteeringAngle(721);
+  testWaitForTimeout(70);
+  if (!verifyCurrentStatus("1.2", 2)) return;
+  testStep("2.0", "Check: Wait 89 ms");
+  setSteeringAngle(0);
+  checkStatusNotChangedAtTime("2.1", 89, 1);
+}
+
+testcase TC_REC_TIM_02_RecoveryWithin90To110ms()
+{
+  long recoverMs;
+  testStep("1.0", "Action: Create Fault Level 2");
+  if (!setupAndClearFault("1.1", 1, 1, 0)) return;
+  setSteeringAngle(721);
+  testWaitForTimeout(70);
+  if (!verifyCurrentStatus("1.2", 2)) return;
+  testStep("2.0", "Measure: Time to Level 1");
+  recoverMs = measureTimeAfterChange(0, 1, 150, 10);
+  checkTimeLimit("3.0", recoverMs, 90, 110);
+  verifyCurrentStatus("3.1", 1);
+}
+
+void mainTest()
+{
+  testModuleTitle("Req 7: Steering Error Validation");
+
+  TC_PRE_01_NoDetection_When_EngineIsOff();
+  TC_PRE_02_NoDetection_When_IgnitionIsOff();
+
+  TC_DET_BVA_01_NoFault_When_StrIs720();
+  TC_DET_BVA_02_NoFault_When_StrIsMinus720();
+  TC_DET_BVA_03_FaultDetected_When_StrIs721();
+  TC_DET_BVA_04_FaultDetected_When_StrIsMinus721();
+  
+  TC_DET_TIM_01_NoFaultBefore39ms();
+  TC_DET_TIM_02_FaultWithin40To60ms();
+
+  TC_REC_BVA_01_NoRecovery_When_StrIs721();
+  TC_REC_BVA_02_Recovery_When_StrIs720();
+  TC_REC_BVA_03_NoRecovery_When_StrIsMinus721();
+  TC_REC_BVA_04_Recovery_When_StrIsMinus720();
+
+  TC_REC_TIM_01_NoRecoveryBefore89ms();
+  TC_REC_TIM_02_RecoveryWithin90To110ms();
+}
