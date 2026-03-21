@@ -1,0 +1,165 @@
+/*@!Encoding:65001*/
+includes { }
+
+variables
+{
+  message Fault_sts_Rsp Fault_sts_Rsp_msg;
+  message Fault_sts_Req Fault_sts_Req_msg;
+}
+
+on message Fault_sts_Rsp
+{
+  Fault_sts_Rsp_msg = this;
+}
+
+// -----------------------------------------------------------------
+// Helper Functions
+// -----------------------------------------------------------------
+
+void setupPreCondition(long engineSts, long ignitionSts, long battPercent)
+{
+  @sysvar::ENG::Sys_ENG_10ms_En = 1;
+  @sysvar::ENG::Sys_IGN_2ms_En = 1;
+  @sysvar::BMS::Sys_BMS_10ms_En = 1;
+
+  @sysvar::ENG::Sys_Engine_sts = engineSts;
+  @sysvar::ENG::Sys_Ignition_sts = ignitionSts;
+  @sysvar::BMS::Sys_Batt_Percent = battPercent; // Req 2: Needs 80% or more [cite: 460]
+
+  Fault_sts_Req_msg.All_Fault_clr_request = 0;
+  Fault_sts_Req_msg.All_Fault_sts_request = 0;
+  output(Fault_sts_Req_msg);
+
+  testWaitForTimeout(100);
+}
+
+void setChgCondition(long cond)
+{
+  @sysvar::BMS::Sys_Batt_Chg_Sts = cond; // Signal: Batt_Chg_Sts [cite: 86]
+}
+
+int requestFaultStatus(long timeoutMs)
+{
+  Fault_sts_Req_msg.All_Fault_sts_request = 1;
+  output(Fault_sts_Req_msg);
+
+  if (testWaitForMessage(Fault_sts_Rsp, timeoutMs))
+  {
+    Fault_sts_Req_msg.All_Fault_sts_request = 0;
+    output(Fault_sts_Req_msg);
+    return 1;
+  }
+  Fault_sts_Req_msg.All_Fault_sts_request = 0;
+  output(Fault_sts_Req_msg);
+  return 0;
+}
+
+void clearAllFault()
+{
+  Fault_sts_Req_msg.All_Fault_sts_request = 0;
+  Fault_sts_Req_msg.All_Fault_clr_request = 1;
+  output(Fault_sts_Req_msg);
+  testWaitForTimeout(50);
+  Fault_sts_Req_msg.All_Fault_clr_request = 0;
+  output(Fault_sts_Req_msg);
+  testWaitForTimeout(50);
+}
+
+int verifyChgErrorStatus(char stepId[], long expected)
+{
+  testWaitForTimeout(20);
+
+  if (!requestFaultStatus(100))
+  {
+    testStepFail(stepId, "Fail. No response. Expected: %d, Actual: Timeout", expected);
+    return 0;
+  }
+
+  if (Fault_sts_Rsp_msg.BATT_Chg_Err_sts != expected) // Signal: BATT_Chg_Err_sts [cite: 277]
+  {
+    testStepFail(stepId, "Fail. Expected: %d, Actual: %d", expected, Fault_sts_Rsp_msg.BATT_Chg_Err_sts);
+    return 0;
+  }
+
+  testStepPass(stepId, "Pass. Expected: %d, Actual: %d", expected, Fault_sts_Rsp_msg.BATT_Chg_Err_sts);
+  return 1;
+}
+
+long measureTimeAfterChgChange(long cond, long targetStatus, long maxWaitMs)
+{
+  dword startTime;
+  dword currentTime;
+  long elapsed;
+
+  startTime = timeNow();
+  setChgCondition(cond);
+
+  while (1)
+  {
+    testWaitForTimeout(10);
+    currentTime = timeNow();
+    elapsed = (currentTime - startTime) / 100;
+
+    if (elapsed > maxWaitMs) break;
+
+    if (requestFaultStatus(50))
+    {
+      if (Fault_sts_Rsp_msg.BATT_Chg_Err_sts == targetStatus)
+      {
+        return (timeNow() - startTime) / 100;
+      }
+    }
+  }
+  return -1;
+}
+
+// -----------------------------------------------------------------
+// Test Cases (Requirement 2: Battery Charging Error) [cite: 460]
+// -----------------------------------------------------------------
+
+testcase TC_1_Detection_Time_Check()
+{
+  long detectMs;
+  testStep("1.0", "Setup: Engine=Run, IGN=On, Batt=85%"); // Pre-condition Batt 80%+ [cite: 460]
+  setupPreCondition(1, 1, 85);
+  clearAllFault();
+
+  testStep("2.0", "Action: Set Chg Condition to 1 and measure time");
+  detectMs = measureTimeAfterChgChange(1, 2, 5200); 
+  
+  testStep("3.0", "Verify: Time 4900 ~ 5100 ms"); // Detection 5000ms +/- 100 [cite: 460]
+  if (detectMs < 4900 || detectMs > 5100)
+    testStepFail("3.1", "Fail. Time: %d ms. Expected: 4900 ~ 5100", detectMs);
+  else
+    testStepPass("3.1", "Pass. Time: %d ms. Expected: 4900 ~ 5100", detectMs);
+
+  verifyChgErrorStatus("3.2", 2);
+}
+
+testcase TC_2_Recovery_Time_Check()
+{
+  long recoverMs;
+  testStep("1.0", "Setup: Create Fault (Chg Cond 1)");
+  setupPreCondition(1, 1, 85);
+  setChgCondition(1);
+  testWaitForTimeout(5200);
+  if (!verifyChgErrorStatus("1.1", 2)) return;
+
+  testStep("2.0", "Action: Set Chg Condition to 0 and measure time");
+  recoverMs = measureTimeAfterChgChange(0, 1, 150); 
+
+  testStep("3.0", "Verify: Time 90 ~ 110 ms"); // Recovery 100ms +/- 10 [cite: 460]
+  if (recoverMs < 90 || recoverMs > 110)
+    testStepFail("3.1", "Fail. Time: %d ms. Expected: 90 ~ 110", recoverMs);
+  else
+    testStepPass("3.1", "Pass. Time: %d ms. Expected: 90 ~ 110", recoverMs);
+
+  verifyChgErrorStatus("3.2", 1);
+}
+
+void mainTest()
+{
+  testModuleTitle("Req 2: Battery Charging Error Validation");
+  TC_1_Detection_Time_Check();
+  TC_2_Recovery_Time_Check();
+}
