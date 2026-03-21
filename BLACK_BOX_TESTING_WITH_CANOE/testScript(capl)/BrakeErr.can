@@ -1,0 +1,578 @@
+/*@!Encoding:65001*/
+includes { }
+
+variables
+{
+  message Fault_sts_Rsp Fault_sts_Rsp_msg; // ID: 0x556
+  message Fault_sts_Req Fault_sts_Req_msg; // ID: 0x555
+
+  // Signal Types
+  const int SIG_BRAKE = 1;
+  const int SIG_ACCEL = 2;
+  const int SIG_SPEED = 3;
+}
+
+on message Fault_sts_Rsp
+{
+  Fault_sts_Rsp_msg = this;
+}
+
+// -----------------------------------------------------------------
+// Helper Functions (Multi-Signal Architecture)
+// -----------------------------------------------------------------
+
+void setupPreCondition(long engineSts, long ignSts)
+{
+  @sysvar::ENG::Sys_ENG_10ms_En = 1;
+  @sysvar::ENG::Sys_IGN_2ms_En = 1;
+  @sysvar::BRK::Sys_BRK_10ms_En = 1; // Enable Brake Node
+  
+  @sysvar::STR::Sys_STR_10ms_En = 0;
+  @sysvar::BMS::Sys_BMS_10ms_En = 0; // Disable others
+
+  @sysvar::ENG::Sys_Engine_sts = engineSts;
+  @sysvar::ENG::Sys_Ignition_sts = ignSts;
+  
+  // Initialize to normal values
+  @sysvar::BRK::Sys_Brake_press = 0;
+  @sysvar::BRK::Sys_ACCEL_press = 0;
+  @sysvar::BRK::Sys_Vehicle_Speed = 0;
+
+  Fault_sts_Req_msg.All_Fault_clr_request = 0;
+  Fault_sts_Req_msg.All_Fault_sts_request = 0;
+  output(Fault_sts_Req_msg);
+
+  testWaitForTimeout(100);
+}
+
+void setSignalValue(int sigType, long val)
+{
+  if (sigType == SIG_BRAKE) @sysvar::BRK::Sys_Brake_press = val;
+  else if (sigType == SIG_ACCEL) @sysvar::BRK::Sys_ACCEL_press = val;
+  else if (sigType == SIG_SPEED) @sysvar::BRK::Sys_Vehicle_Speed = val;
+}
+
+long getSignalStatus(int sigType)
+{
+  if (sigType == SIG_BRAKE) return Fault_sts_Rsp_msg.Brake_Err_sts;
+  else if (sigType == SIG_ACCEL) return Fault_sts_Rsp_msg.ACCEL_Err_sts;
+  else if (sigType == SIG_SPEED) return Fault_sts_Rsp_msg.Speed_Err_sts;
+  return -1;
+}
+
+int requestFaultStatus(long timeoutMs)
+{
+  Fault_sts_Req_msg.All_Fault_sts_request = 1;
+  output(Fault_sts_Req_msg);
+
+  if (testWaitForMessage(Fault_sts_Rsp, timeoutMs))
+  {
+    Fault_sts_Req_msg.All_Fault_sts_request = 0;
+    output(Fault_sts_Req_msg); // 10ms Rule Fix
+    return 1;
+  }
+  Fault_sts_Req_msg.All_Fault_sts_request = 0;
+  output(Fault_sts_Req_msg);
+  return 0;
+}
+
+void clearAllFault()
+{
+  Fault_sts_Req_msg.All_Fault_sts_request = 0;
+  Fault_sts_Req_msg.All_Fault_clr_request = 1;
+  output(Fault_sts_Req_msg);
+  testWaitForTimeout(50);
+  Fault_sts_Req_msg.All_Fault_clr_request = 0;
+  output(Fault_sts_Req_msg);
+  testWaitForTimeout(50);
+}
+
+int clearAndVerifyNoFault(char stepId[])
+{
+  clearAllFault();
+
+  if (!requestFaultStatus(100))
+  {
+    testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout");
+    return 0;
+  }
+
+  // Verify all 3 are cleared
+  if (Fault_sts_Rsp_msg.Brake_Err_sts != 0 || 
+      Fault_sts_Rsp_msg.ACCEL_Err_sts != 0 || 
+      Fault_sts_Rsp_msg.Speed_Err_sts != 0)
+  {
+    testStepFail(stepId, "Fail. Expected: All 0, Actual: Brk=%d, Acc=%d, Spd=%d", 
+      Fault_sts_Rsp_msg.Brake_Err_sts, Fault_sts_Rsp_msg.ACCEL_Err_sts, Fault_sts_Rsp_msg.Speed_Err_sts);
+    return 0;
+  }
+
+  testStepPass(stepId, "Pass. Expected: All 0, Actual: All 0");
+  return 1;
+}
+
+int verifyCurrentStatus(char stepId[], int sigType, long expected)
+{
+  long actual;
+  testWaitForTimeout(20); // 10ms Rule gap
+
+  if (!requestFaultStatus(100))
+  {
+    testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout");
+    return 0;
+  }
+
+  actual = getSignalStatus(sigType);
+  if (actual != expected)
+  {
+    testStepFail(stepId, "Fail. Expected: %d, Actual: %d", expected, actual);
+    return 0;
+  }
+
+  testStepPass(stepId, "Pass. Expected: %d, Actual: %d", expected, actual);
+  return 1;
+}
+
+long measureTimeAfterChange(int sigType, long val, long targetStatus, long maxWaitMs, long pollMs)
+{
+  dword startTime;
+  dword currentTime;
+  long elapsed;
+  long actualStatus;
+
+  startTime = timeNow();
+  setSignalValue(sigType, val);
+
+  while (1)
+  {
+    testWaitForTimeout(pollMs); 
+    currentTime = timeNow();
+    elapsed = (currentTime - startTime) / 100;
+
+    if (elapsed > maxWaitMs) break;
+
+    if (requestFaultStatus(50))
+    {
+      actualStatus = getSignalStatus(sigType);
+      if (actualStatus == targetStatus)
+      {
+        return (timeNow() - startTime) / 100;
+      }
+    }
+  }
+  return -1;
+}
+
+int checkTimeLimit(char stepId[], int sigType, long measuredMs, long minMs, long maxMs)
+{
+  if (measuredMs < 0)
+  {
+    testStepFail(stepId, "Fail. Expected: Change within %d ms, Actual: Timeout", maxMs);
+    return 0;
+  }
+
+  if (measuredMs < minMs || measuredMs > maxMs)
+  {
+    testStepFail(stepId, "Fail. Expected: %d ~ %d ms, Actual: %d ms", minMs, maxMs, measuredMs);
+    return 0;
+  }
+
+  testStepPass(stepId, "Pass. Expected: %d ~ %d ms, Actual: %d ms", minMs, maxMs, measuredMs);
+  return 1;
+}
+
+int checkStatusNotChangedAtTime(char stepId[], int sigType, long waitMs, long unexpectedStatus)
+{
+  long actual;
+  testWaitForTimeout(20); 
+  testWaitForTimeout(waitMs);
+
+  if (!requestFaultStatus(100))
+  {
+    testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout");
+    return 0;
+  }
+
+  actual = getSignalStatus(sigType);
+  if (actual == unexpectedStatus)
+  {
+    testStepFail(stepId, "Fail. Expected: NOT %d yet, Actual: %d at %d ms", unexpectedStatus, actual, waitMs);
+    return 0;
+  }
+
+  testStepPass(stepId, "Pass. Expected: NOT %d yet, Actual: %d at %d ms", unexpectedStatus, actual, waitMs);
+  return 1;
+}
+
+int checkNoFaultForDuration(char stepId[], int sigType, long totalWaitMs, long pollMs)
+{
+  dword startTime;
+  dword currentTime;
+  long elapsed;
+  long actualStatus;
+
+  testWaitForTimeout(20); 
+  startTime = timeNow();
+
+  while (1)
+  {
+    currentTime = timeNow();
+    elapsed = (currentTime - startTime) / 100;
+
+    if (elapsed > totalWaitMs) break;
+
+    if (!requestFaultStatus(100))
+    {
+      testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout at %d ms", elapsed);
+      return 0;
+    }
+
+    actualStatus = getSignalStatus(sigType);
+    if (actualStatus == 2)
+    {
+      testStepFail(stepId, "Fail. Expected: 0, Actual: 2 (Fault detected early at %d ms)", elapsed);
+      return 0;
+    }
+
+    testWaitForTimeout(pollMs);
+  }
+
+  testStepPass(stepId, "Pass. Expected: 0 for %d ms, Actual: 0", totalWaitMs);
+  return 1;
+}
+
+int setupAndClearFault(char clearStepId[], long engineSts, long ignSts)
+{
+  setupPreCondition(engineSts, ignSts);
+  if (!clearAndVerifyNoFault(clearStepId)) return 0;
+  return 1;
+}
+
+// -----------------------------------------------------------------
+// Test Cases - Preconditions
+// -----------------------------------------------------------------
+
+testcase TC_PRE_01_NoDetection_When_EngineIsOff()
+{
+  testStep("1.0", "Setup: Engine=0(Off), IGN=1(On)");
+  if (!setupAndClearFault("1.1", 0, 1)) return;
+
+  testStep("2.0", "Check: Set Brake=127 and wait 520 ms");
+  setSignalValue(SIG_BRAKE, 127);
+  checkNoFaultForDuration("2.1", SIG_BRAKE, 520, 20);
+}
+
+testcase TC_PRE_02_NoDetection_When_IgnitionIsOff()
+{
+  testStep("1.0", "Setup: Engine=1(Run), IGN=0(Off)");
+  if (!setupAndClearFault("1.1", 1, 0)) return;
+
+  testStep("2.0", "Check: Set Brake=127 and wait 520 ms");
+  setSignalValue(SIG_BRAKE, 127);
+  checkNoFaultForDuration("2.1", SIG_BRAKE, 520, 20);
+}
+
+// -----------------------------------------------------------------
+// Test Cases - 1) Brake Error (Detect: 127, Recover: 126)
+// -----------------------------------------------------------------
+
+testcase TC_BRK_DET_BVA_01_NoFault_When_BrakeIs126()
+{
+  testStep("1.0", "Setup: Engine=1, IGN=1");
+  if (!setupAndClearFault("1.1", 1, 1)) return;
+
+  testStep("2.0", "Check: Set Brake=126 (Safe Border) and wait 520 ms");
+  setSignalValue(SIG_BRAKE, 126);
+  checkNoFaultForDuration("2.1", SIG_BRAKE, 520, 20);
+}
+
+testcase TC_BRK_DET_BVA_02_FaultDetected_When_BrakeIs127()
+{
+  testStep("1.0", "Setup: Engine=1, IGN=1");
+  if (!setupAndClearFault("1.1", 1, 1)) return;
+
+  testStep("2.0", "Action: Set Brake=127 (Fault) and wait 520 ms");
+  setSignalValue(SIG_BRAKE, 127);
+  testWaitForTimeout(520);
+  verifyCurrentStatus("3.0", SIG_BRAKE, 2);
+}
+
+testcase TC_BRK_DET_TIM_01_NoFaultBefore489ms()
+{
+  testStep("1.0", "Setup: Engine=1, IGN=1");
+  if (!setupAndClearFault("1.1", 1, 1)) return;
+
+  testStep("2.0", "Check: Wait 489 ms (Under limit)");
+  setSignalValue(SIG_BRAKE, 127);
+  checkStatusNotChangedAtTime("2.1", SIG_BRAKE, 489, 2);
+}
+
+testcase TC_BRK_DET_TIM_02_FaultWithin490To510ms()
+{
+  long detectMs;
+  testStep("1.0", "Setup: Engine=1, IGN=1");
+  if (!setupAndClearFault("1.1", 1, 1)) return;
+
+  testStep("2.0", "Measure: Time to reach Level 2");
+  detectMs = measureTimeAfterChange(SIG_BRAKE, 127, 2, 530, 10);
+  
+  checkTimeLimit("3.0", SIG_BRAKE, detectMs, 490, 510);
+  verifyCurrentStatus("3.1", SIG_BRAKE, 2);
+}
+
+testcase TC_BRK_REC_BVA_01_Recovery_When_BrakeIs126()
+{
+  testStep("1.0", "Action: Create Fault Level 2");
+  if (!setupAndClearFault("1.1", 1, 1)) return;
+  setSignalValue(SIG_BRAKE, 127);
+  testWaitForTimeout(520);
+  if (!verifyCurrentStatus("1.2", SIG_BRAKE, 2)) return;
+
+  testStep("2.0", "Action: Set Brake=126 (Recover) and wait 120 ms");
+  setSignalValue(SIG_BRAKE, 126);
+  testWaitForTimeout(120);
+
+  verifyCurrentStatus("2.1", SIG_BRAKE, 1);
+}
+
+testcase TC_BRK_REC_TIM_01_NoRecoveryBefore89ms()
+{
+  testStep("1.0", "Action: Create Fault Level 2");
+  if (!setupAndClearFault("1.1", 1, 1)) return;
+  setSignalValue(SIG_BRAKE, 127);
+  testWaitForTimeout(520);
+  if (!verifyCurrentStatus("1.2", SIG_BRAKE, 2)) return;
+
+  testStep("2.0", "Check: Wait 89 ms (Under limit)");
+  setSignalValue(SIG_BRAKE, 126);
+  checkStatusNotChangedAtTime("2.1", SIG_BRAKE, 89, 1);
+}
+
+testcase TC_BRK_REC_TIM_02_RecoveryWithin90To110ms()
+{
+  long recoverMs;
+  testStep("1.0", "Action: Create Fault Level 2");
+  if (!setupAndClearFault("1.1", 1, 1)) return;
+  setSignalValue(SIG_BRAKE, 127);
+  testWaitForTimeout(520);
+  if (!verifyCurrentStatus("1.2", SIG_BRAKE, 2)) return;
+
+  testStep("2.0", "Measure: Time to reach Level 1");
+  recoverMs = measureTimeAfterChange(SIG_BRAKE, 126, 1, 150, 10);
+  
+  checkTimeLimit("3.0", SIG_BRAKE, recoverMs, 90, 110);
+  verifyCurrentStatus("3.1", SIG_BRAKE, 1);
+}
+
+// -----------------------------------------------------------------
+// Test Cases - 2) ACCEL Error (Detect: 127, Recover: 126)
+// -----------------------------------------------------------------
+
+testcase TC_ACC_DET_BVA_01_NoFault_When_AccelIs126()
+{
+  testStep("1.0", "Setup: Engine=1, IGN=1");
+  if (!setupAndClearFault("1.1", 1, 1)) return;
+  
+  testStep("2.0", "Check: Set Accel=126 and wait 520 ms");
+  setSignalValue(SIG_ACCEL, 126);
+  checkNoFaultForDuration("2.1", SIG_ACCEL, 520, 20);
+}
+
+testcase TC_ACC_DET_BVA_02_FaultDetected_When_AccelIs127()
+{
+  testStep("1.0", "Setup: Engine=1, IGN=1");
+  if (!setupAndClearFault("1.1", 1, 1)) return;
+  
+  testStep("2.0", "Action: Set Accel=127 and wait 520 ms");
+  setSignalValue(SIG_ACCEL, 127);
+  testWaitForTimeout(520);
+  verifyCurrentStatus("2.1", SIG_ACCEL, 2);
+}
+
+testcase TC_ACC_DET_TIM_01_NoFaultBefore489ms()
+{
+  testStep("1.0", "Setup: Engine=1, IGN=1");
+  if (!setupAndClearFault("1.1", 1, 1)) return;
+  
+  testStep("2.0", "Check: Wait 489 ms");
+  setSignalValue(SIG_ACCEL, 127);
+  checkStatusNotChangedAtTime("2.1", SIG_ACCEL, 489, 2);
+}
+
+testcase TC_ACC_DET_TIM_02_FaultWithin490To510ms()
+{
+  long detectMs;
+  testStep("1.0", "Setup: Engine=1, IGN=1");
+  if (!setupAndClearFault("1.1", 1, 1)) return;
+  
+  testStep("2.0", "Measure: Time to reach Level 2");
+  detectMs = measureTimeAfterChange(SIG_ACCEL, 127, 2, 530, 10);
+  checkTimeLimit("3.0", SIG_ACCEL, detectMs, 490, 510);
+  verifyCurrentStatus("3.1", SIG_ACCEL, 2);
+}
+
+testcase TC_ACC_REC_BVA_01_Recovery_When_AccelIs126()
+{
+  testStep("1.0", "Action: Create Fault Level 2");
+  if (!setupAndClearFault("1.1", 1, 1)) return;
+  setSignalValue(SIG_ACCEL, 127);
+  testWaitForTimeout(520);
+  if (!verifyCurrentStatus("1.2", SIG_ACCEL, 2)) return;
+
+  testStep("2.0", "Action: Set Accel=126 and wait 120 ms");
+  setSignalValue(SIG_ACCEL, 126);
+  testWaitForTimeout(120);
+  verifyCurrentStatus("2.1", SIG_ACCEL, 1);
+}
+
+testcase TC_ACC_REC_TIM_01_NoRecoveryBefore89ms()
+{
+  testStep("1.0", "Action: Create Fault Level 2");
+  if (!setupAndClearFault("1.1", 1, 1)) return;
+  setSignalValue(SIG_ACCEL, 127);
+  testWaitForTimeout(520);
+  if (!verifyCurrentStatus("1.2", SIG_ACCEL, 2)) return;
+
+  testStep("2.0", "Check: Wait 89 ms");
+  setSignalValue(SIG_ACCEL, 126);
+  checkStatusNotChangedAtTime("2.1", SIG_ACCEL, 89, 1);
+}
+
+testcase TC_ACC_REC_TIM_02_RecoveryWithin90To110ms()
+{
+  long recoverMs;
+  testStep("1.0", "Action: Create Fault Level 2");
+  if (!setupAndClearFault("1.1", 1, 1)) return;
+  setSignalValue(SIG_ACCEL, 127);
+  testWaitForTimeout(520);
+  if (!verifyCurrentStatus("1.2", SIG_ACCEL, 2)) return;
+
+  testStep("2.0", "Measure: Time to reach Level 1");
+  recoverMs = measureTimeAfterChange(SIG_ACCEL, 126, 1, 150, 10);
+  checkTimeLimit("3.0", SIG_ACCEL, recoverMs, 90, 110);
+  verifyCurrentStatus("3.1", SIG_ACCEL, 1);
+}
+
+// -----------------------------------------------------------------
+// Test Cases - 3) Vehicle Speed Error (Detect: 255, Recover: 254)
+// -----------------------------------------------------------------
+
+testcase TC_SPD_DET_BVA_01_NoFault_When_SpeedIs254()
+{
+  testStep("1.0", "Setup: Engine=1, IGN=1");
+  if (!setupAndClearFault("1.1", 1, 1)) return;
+  
+  testStep("2.0", "Check: Set Speed=254 and wait 520 ms");
+  setSignalValue(SIG_SPEED, 254);
+  checkNoFaultForDuration("2.1", SIG_SPEED, 520, 20);
+}
+
+testcase TC_SPD_DET_BVA_02_FaultDetected_When_SpeedIs255()
+{
+  testStep("1.0", "Setup: Engine=1, IGN=1");
+  if (!setupAndClearFault("1.1", 1, 1)) return;
+  
+  testStep("2.0", "Action: Set Speed=255 and wait 520 ms");
+  setSignalValue(SIG_SPEED, 255);
+  testWaitForTimeout(520);
+  verifyCurrentStatus("2.1", SIG_SPEED, 2);
+}
+
+testcase TC_SPD_DET_TIM_01_NoFaultBefore489ms()
+{
+  testStep("1.0", "Setup: Engine=1, IGN=1");
+  if (!setupAndClearFault("1.1", 1, 1)) return;
+  
+  testStep("2.0", "Check: Wait 489 ms");
+  setSignalValue(SIG_SPEED, 255);
+  checkStatusNotChangedAtTime("2.1", SIG_SPEED, 489, 2);
+}
+
+testcase TC_SPD_DET_TIM_02_FaultWithin490To510ms()
+{
+  long detectMs;
+  testStep("1.0", "Setup: Engine=1, IGN=1");
+  if (!setupAndClearFault("1.1", 1, 1)) return;
+  
+  testStep("2.0", "Measure: Time to reach Level 2");
+  detectMs = measureTimeAfterChange(SIG_SPEED, 255, 2, 530, 10);
+  checkTimeLimit("3.0", SIG_SPEED, detectMs, 490, 510);
+  verifyCurrentStatus("3.1", SIG_SPEED, 2);
+}
+
+testcase TC_SPD_REC_BVA_01_Recovery_When_SpeedIs254()
+{
+  testStep("1.0", "Action: Create Fault Level 2");
+  if (!setupAndClearFault("1.1", 1, 1)) return;
+  setSignalValue(SIG_SPEED, 255);
+  testWaitForTimeout(520);
+  if (!verifyCurrentStatus("1.2", SIG_SPEED, 2)) return;
+
+  testStep("2.0", "Action: Set Speed=254 and wait 120 ms");
+  setSignalValue(SIG_SPEED, 254);
+  testWaitForTimeout(120);
+  verifyCurrentStatus("2.1", SIG_SPEED, 1);
+}
+
+testcase TC_SPD_REC_TIM_01_NoRecoveryBefore89ms()
+{
+  testStep("1.0", "Action: Create Fault Level 2");
+  if (!setupAndClearFault("1.1", 1, 1)) return;
+  setSignalValue(SIG_SPEED, 255);
+  testWaitForTimeout(520);
+  if (!verifyCurrentStatus("1.2", SIG_SPEED, 2)) return;
+
+  testStep("2.0", "Check: Wait 89 ms");
+  setSignalValue(SIG_SPEED, 254);
+  checkStatusNotChangedAtTime("2.1", SIG_SPEED, 89, 1);
+}
+
+testcase TC_SPD_REC_TIM_02_RecoveryWithin90To110ms()
+{
+  long recoverMs;
+  testStep("1.0", "Action: Create Fault Level 2");
+  if (!setupAndClearFault("1.1", 1, 1)) return;
+  setSignalValue(SIG_SPEED, 255);
+  testWaitForTimeout(520);
+  if (!verifyCurrentStatus("1.2", SIG_SPEED, 2)) return;
+
+  testStep("2.0", "Measure: Time to reach Level 1");
+  recoverMs = measureTimeAfterChange(SIG_SPEED, 254, 1, 150, 10);
+  checkTimeLimit("3.0", SIG_SPEED, recoverMs, 90, 110);
+  verifyCurrentStatus("3.1", SIG_SPEED, 1);
+}
+
+void mainTest()
+{
+  testModuleTitle("Req 6: Brake Error Validation (Brake, Accel, Speed)");
+
+  TC_PRE_01_NoDetection_When_EngineIsOff();
+  TC_PRE_02_NoDetection_When_IgnitionIsOff();
+
+  // 1) Brake Error
+  TC_BRK_DET_BVA_01_NoFault_When_BrakeIs126();
+  TC_BRK_DET_BVA_02_FaultDetected_When_BrakeIs127();
+  TC_BRK_DET_TIM_01_NoFaultBefore489ms();
+  TC_BRK_DET_TIM_02_FaultWithin490To510ms();
+  TC_BRK_REC_BVA_01_Recovery_When_BrakeIs126();
+  TC_BRK_REC_TIM_01_NoRecoveryBefore89ms();
+  TC_BRK_REC_TIM_02_RecoveryWithin90To110ms();
+
+  // 2) ACCEL Error
+  TC_ACC_DET_BVA_01_NoFault_When_AccelIs126();
+  TC_ACC_DET_BVA_02_FaultDetected_When_AccelIs127();
+  TC_ACC_DET_TIM_01_NoFaultBefore489ms();
+  TC_ACC_DET_TIM_02_FaultWithin490To510ms();
+  TC_ACC_REC_BVA_01_Recovery_When_AccelIs126();
+  TC_ACC_REC_TIM_01_NoRecoveryBefore89ms();
+  TC_ACC_REC_TIM_02_RecoveryWithin90To110ms();
+
+  // 3) Speed Error
+  TC_SPD_DET_BVA_01_NoFault_When_SpeedIs254();
+  TC_SPD_DET_BVA_02_FaultDetected_When_SpeedIs255();
+  TC_SPD_DET_TIM_01_NoFaultBefore489ms();
+  TC_SPD_DET_TIM_02_FaultWithin490To510ms();
+  TC_SPD_REC_BVA_01_Recovery_When_SpeedIs254();
+  TC_SPD_REC_TIM_01_NoRecoveryBefore89ms();
+  TC_SPD_REC_TIM_02_RecoveryWithin90To110ms();
+}
