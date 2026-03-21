@@ -1,0 +1,410 @@
+/*@!Encoding:65001*/
+includes { }
+
+variables
+{
+  message Fault_sts_Rsp Fault_sts_Rsp_msg; // ID: 0x556 [cite: 263]
+  message Fault_sts_Req Fault_sts_Req_msg; // ID: 0x555 [cite: 246]
+}
+
+on message Fault_sts_Rsp
+{
+  Fault_sts_Rsp_msg = this;
+}
+
+// -----------------------------------------------------------------
+// Helper Functions
+// -----------------------------------------------------------------
+
+void setupPreCondition(long engineSts, long ignitionSts, float battVoltage)
+{
+  // Activate needed nodes
+  @sysvar::ENG::Sys_ENG_10ms_En = 1;
+  @sysvar::ENG::Sys_IGN_2ms_En = 1;
+  @sysvar::BMS::Sys_BMS_10ms_En = 1;
+  
+  // Deactivate other nodes
+  @sysvar::STR::Sys_STR_10ms_En = 0;
+  @sysvar::BRK::Sys_BRK_10ms_En = 0;
+
+  @sysvar::ENG::Sys_Engine_sts = engineSts; // 1: Run, 0: Stop [cite: 142]
+  @sysvar::ENG::Sys_Ignition_sts = ignitionSts; // 1: On, 0: Off [cite: 123]
+  @sysvar::BMS::Sys_Batt_Voltage = battVoltage; // Factor 0.001 [cite: 110]
+
+  // Reset request bits
+  Fault_sts_Req_msg.All_Fault_clr_request = 0;
+  Fault_sts_Req_msg.All_Fault_sts_request = 0;
+  output(Fault_sts_Req_msg);
+
+  testWaitForTimeout(100);
+}
+
+void setBattVoltage(float battVoltage)
+{
+  @sysvar::BMS::Sys_Batt_Voltage = battVoltage;
+}
+
+int requestFaultStatus(long timeoutMs)
+{
+  Fault_sts_Req_msg.All_Fault_sts_request = 1;
+  output(Fault_sts_Req_msg);
+
+  if (testWaitForMessage(Fault_sts_Rsp, timeoutMs))
+  {
+    // Clear request immediately after response
+    Fault_sts_Req_msg.All_Fault_sts_request = 0;
+    output(Fault_sts_Req_msg);
+    return 1;
+  }
+
+  Fault_sts_Req_msg.All_Fault_sts_request = 0;
+  output(Fault_sts_Req_msg);
+  return 0;
+}
+
+void clearAllFault()
+{
+  Fault_sts_Req_msg.All_Fault_sts_request = 0;
+  Fault_sts_Req_msg.All_Fault_clr_request = 1;
+  output(Fault_sts_Req_msg);
+  testWaitForTimeout(50);
+
+  Fault_sts_Req_msg.All_Fault_clr_request = 0;
+  output(Fault_sts_Req_msg);
+  testWaitForTimeout(50);
+}
+
+int clearAndVerifyNoFault(char stepId[])
+{
+  clearAllFault();
+
+  if (!requestFaultStatus(100))
+  {
+    testStepFail(stepId, "Fail. ECU did not answer after clear.");
+    return 0;
+  }
+
+  // Level 0 means deleted/normal [cite: 40]
+  if (Fault_sts_Rsp_msg.BATT_Vol_Err_sts != 0)
+  {
+    testStepFail(stepId, "Fail. Fault status is %d (Expected: 0).", Fault_sts_Rsp_msg.BATT_Vol_Err_sts);
+    return 0;
+  }
+
+  testStepPass(stepId, "Pass. Faults are cleared.");
+  return 1;
+}
+
+int verifyCurrentVolStatus(char stepId[], long expected)
+{
+  // 💡 Add 20ms to follow the "10ms rule" and avoid ignore 
+  testWaitForTimeout(20);
+
+  if (!requestFaultStatus(100))
+  {
+    testStepFail(stepId, "Fail. No response from ECU.");
+    return 0;
+  }
+
+  if (Fault_sts_Rsp_msg.BATT_Vol_Err_sts != expected)
+  {
+    testStepFail(stepId, "Fail. Current status is %d (Expected: %d).", Fault_sts_Rsp_msg.BATT_Vol_Err_sts, expected);
+    return 0;
+  }
+
+  testStepPass(stepId, "Pass. Status is %d.", expected);
+  return 1;
+}
+
+long measureTimeAfterVoltageChange(float battVoltage, long targetStatus, long maxWaitMs, long pollMs)
+{
+  dword startTime;
+  dword currentTime;
+  long elapsed;
+
+  startTime = timeNow();
+  setBattVoltage(battVoltage);
+
+  while (1)
+  {
+    // 💡 Wait first to avoid immediate request within 10ms 
+    testWaitForTimeout(pollMs); 
+    
+    currentTime = timeNow();
+    elapsed = (currentTime - startTime) / 100;
+
+    if (elapsed > maxWaitMs) break;
+
+    if (requestFaultStatus(50))
+    {
+      if (Fault_sts_Rsp_msg.BATT_Vol_Err_sts == targetStatus)
+      {
+        currentTime = timeNow();
+        return (currentTime - startTime) / 100;
+      }
+    }
+  }
+  return -1;
+}
+
+int checkTimeLimit(char stepId[], long measuredMs, long minMs, long maxMs)
+{
+  if (measuredMs < 0)
+  {
+    testStepFail(stepId, "Fail. Status did not change within %d ms.", maxMs);
+    return 0;
+  }
+
+  if (measuredMs < minMs || measuredMs > maxMs)
+  {
+    testStepFail(stepId, "Fail. Time was %d ms (Expected: %d ~ %d ms).", measuredMs, minMs, maxMs);
+    return 0;
+  }
+
+  testStepPass(stepId, "Pass. Time was %d ms (Target: %d ~ %d ms).", measuredMs, minMs, maxMs);
+  return 1;
+}
+
+int checkStatusNotChangedAtTime(char stepId[], long waitMs, long unexpectedStatus)
+{
+  // 💡 Gap for 10ms rule 
+  testWaitForTimeout(20); 
+  
+  // Actual wait for the test condition
+  testWaitForTimeout(waitMs);
+
+  if (!requestFaultStatus(100))
+  {
+    testStepFail(stepId, "Fail. No response from ECU.");
+    return 0;
+  }
+
+  if (Fault_sts_Rsp_msg.BATT_Vol_Err_sts == unexpectedStatus)
+  {
+    testStepFail(stepId, "Fail. Status became %d too fast at %d ms.", unexpectedStatus, waitMs);
+    return 0;
+  }
+
+  testStepPass(stepId, "Pass. Status is not %d yet as expected.", unexpectedStatus);
+  return 1;
+}
+
+int checkNoFaultForDuration(char stepId[], long totalWaitMs, long pollMs)
+{
+  dword startTime;
+  dword currentTime;
+  long elapsed;
+
+  // 💡 Gap before starting the loop 
+  testWaitForTimeout(20); 
+  
+  startTime = timeNow();
+
+  while (1)
+  {
+    currentTime = timeNow();
+    elapsed = (currentTime - startTime) / 100;
+
+    if (elapsed > totalWaitMs) break;
+
+    if (!requestFaultStatus(100))
+    {
+      testStepFail(stepId, "Fail. No response at %d ms.", elapsed);
+      return 0;
+    }
+
+    if (Fault_sts_Rsp_msg.BATT_Vol_Err_sts == 2)
+    {
+      testStepFail(stepId, "Fail. Fault level 2 detected at %d ms.", elapsed);
+      return 0;
+    }
+
+    testWaitForTimeout(pollMs);
+  }
+
+  testStepPass(stepId, "Pass. No fault for %d ms.", totalWaitMs);
+  return 1;
+}
+
+int setupAndClearFault(char clearStepId[], long engineSts, long ignitionSts, float battVoltage)
+{
+  setupPreCondition(engineSts, ignitionSts, battVoltage);
+
+  if (!clearAndVerifyNoFault(clearStepId))
+  {
+    return 0;
+  }
+  return 1;
+}
+
+// -----------------------------------------------------------------
+// Test Cases (Voltage High - 0.001V Boundary)
+// -----------------------------------------------------------------
+
+testcase TC_PRE_01_NoDetection_When_EngineIsOff()
+{
+  testStep("1.0", "Setup: Engine=0, IGN=1, Voltage=12.000V");
+  if (!setupAndClearFault("1.1", 0, 1, 12.000)) return;
+
+  testStep("2.0", "Check: Set 16.000V and wait 520 ms");
+  setBattVoltage(16.000);
+  checkNoFaultForDuration("2.1", 520, 20);
+}
+
+testcase TC_PRE_02_NoDetection_When_IgnitionIsOff()
+{
+  testStep("1.0", "Setup: Engine=1, IGN=0, Voltage=12.000V");
+  if (!setupAndClearFault("1.1", 1, 0, 12.000)) return;
+
+  testStep("2.0", "Check: Set 16.000V and wait 520 ms");
+  setBattVoltage(16.000);
+  checkNoFaultForDuration("2.1", 520, 20);
+}
+
+testcase TC_DET_COND2_01_NoFault_When_VoltageIs15_500()
+{
+  testStep("1.0", "Setup: Engine=1, IGN=1, Voltage=12.000V");
+  if (!setupAndClearFault("1.1", 1, 1, 12.000)) return;
+
+  testStep("2.0", "Check: Set 15.500V (Border) and wait 520 ms");
+  setBattVoltage(15.500);
+  checkNoFaultForDuration("2.1", 520, 20);
+}
+
+testcase TC_DET_COND2_02_FaultDetected_When_VoltageIs15_501()
+{
+  testStep("1.0", "Setup: Engine=1, IGN=1, Voltage=12.000V");
+  if (!setupAndClearFault("1.1", 1, 1, 12.000)) return;
+
+  testStep("2.0", "Action: Set 15.501V and wait 520 ms");
+  setBattVoltage(15.501);
+  testWaitForTimeout(520);
+  
+  verifyCurrentVolStatus("3.0", 2); // Level 2: Faulted [cite: 38]
+}
+
+testcase TC_DET_TIM2_01_NoFaultBefore489ms_When_VoltageIs15_501()
+{
+  testStep("1.0", "Setup: Engine=1, IGN=1, Voltage=12.000V");
+  if (!setupAndClearFault("1.1", 1, 1, 12.000)) return;
+
+  testStep("2.0", "Check: Wait 489 ms (Under limit)");
+  setBattVoltage(15.501);
+  checkStatusNotChangedAtTime("2.1", 489, 2);
+}
+
+testcase TC_DET_TIM2_02_FaultWithin490To510ms_When_VoltageIs15_501()
+{
+  long detectMs;
+  testStep("1.0", "Setup: Engine=1, IGN=1, Voltage=12.000V");
+  if (!setupAndClearFault("1.1", 1, 1, 12.000)) return;
+
+  testStep("2.0", "Measure: Time to reach Level 2");
+  detectMs = measureTimeAfterVoltageChange(15.501, 2, 530, 10);
+  
+  checkTimeLimit("3.0", detectMs, 490, 510);
+  verifyCurrentVolStatus("3.1", 2);
+}
+
+testcase TC_DET_COND1_01_NoImmediateFault_When_VoltageIs20_000()
+{
+  testStep("1.0", "Setup: Engine=1, IGN=1, Voltage=12.000V");
+  if (!setupAndClearFault("1.1", 1, 1, 12.000)) return;
+
+  testStep("2.0", "Check: Set 20.000V and wait 10 ms");
+  setBattVoltage(20.000);
+  checkStatusNotChangedAtTime("2.1", 10, 2);
+}
+
+testcase TC_DET_COND1_02_ImmediateFault_When_VoltageIs20_001()
+{
+  long detectMs;
+  testStep("1.0", "Setup: Engine=1, IGN=1, Voltage=12.000V");
+  if (!setupAndClearFault("1.1", 1, 1, 12.000)) return;
+
+  testStep("2.0", "Measure: Time to Level 2 (Immediate)");
+  detectMs = measureTimeAfterVoltageChange(20.001, 2, 50, 5);
+  
+  checkTimeLimit("3.0", detectMs, 0, 10); // Tolerance +/- 10ms [cite: 468]
+  verifyCurrentVolStatus("3.1", 2);
+}
+
+testcase TC_REC_COND_01_NoRecovery_When_VoltageIs15_001()
+{
+  testStep("1.0", "Action: Create Fault Level 2");
+  if (!setupAndClearFault("1.1", 1, 1, 12.000)) return;
+  setBattVoltage(16.000);
+  testWaitForTimeout(520);
+  if (!verifyCurrentVolStatus("1.2", 2)) return;
+
+  testStep("2.0", "Check: Set 15.001V and wait 120 ms");
+  setBattVoltage(15.001);
+  testWaitForTimeout(120);
+  
+  verifyCurrentVolStatus("2.1", 2);
+}
+
+testcase TC_REC_COND_02_Recovery_When_VoltageIs15_000()
+{
+  testStep("1.0", "Action: Create Fault Level 2");
+  if (!setupAndClearFault("1.1", 1, 1, 12.000)) return;
+  setBattVoltage(16.000);
+  testWaitForTimeout(520);
+  if (!verifyCurrentVolStatus("1.2", 2)) return;
+
+  testStep("2.0", "Action: Set 15.000V and wait 120 ms");
+  setBattVoltage(15.000);
+  testWaitForTimeout(120);
+
+  verifyCurrentVolStatus("2.1", 1); // Level 1: Fixed [cite: 39]
+}
+
+testcase TC_REC_TIM_01_NoRecoveryBefore89ms_When_VoltageIs14_500()
+{
+  testStep("1.0", "Action: Create Fault Level 2");
+  if (!setupAndClearFault("1.1", 1, 1, 12.000)) return;
+  setBattVoltage(16.000);
+  testWaitForTimeout(520);
+  if (!verifyCurrentVolStatus("1.2", 2)) return;
+
+  testStep("2.0", "Check: Wait 89 ms (Under limit)");
+  setBattVoltage(14.500);
+  checkStatusNotChangedAtTime("2.1", 89, 1);
+}
+
+testcase TC_REC_TIM_02_RecoveryWithin90To110ms_When_VoltageIs14_500()
+{
+  long recoverMs;
+  testStep("1.0", "Action: Create Fault Level 2");
+  if (!setupAndClearFault("1.1", 1, 1, 12.000)) return;
+  setBattVoltage(16.000);
+  testWaitForTimeout(520);
+  if (!verifyCurrentVolStatus("1.2", 2)) return;
+
+  testStep("2.0", "Measure: Time to reach Level 1");
+  recoverMs = measureTimeAfterVoltageChange(14.500, 1, 130, 10);
+  
+  checkTimeLimit("3.0", recoverMs, 90, 110);
+  verifyCurrentVolStatus("3.1", 1);
+}
+
+void mainTest()
+{
+  testModuleTitle("Battery Voltage High Validation Test - Final");
+
+  TC_PRE_01_NoDetection_When_EngineIsOff();
+  TC_PRE_02_NoDetection_When_IgnitionIsOff();
+
+  TC_DET_COND2_01_NoFault_When_VoltageIs15_500();
+  TC_DET_COND2_02_FaultDetected_When_VoltageIs15_501();
+  TC_DET_TIM2_01_NoFaultBefore489ms_When_VoltageIs15_501();
+  TC_DET_TIM2_02_FaultWithin490To510ms_When_VoltageIs15_501();
+
+  TC_DET_COND1_01_NoImmediateFault_When_VoltageIs20_000();
+  TC_DET_COND1_02_ImmediateFault_When_VoltageIs20_001();
+
+  TC_REC_COND_01_NoRecovery_When_VoltageIs15_001();
+  TC_REC_COND_02_Recovery_When_VoltageIs15_000();
+  TC_REC_TIM_01_NoRecoveryBefore89ms_When_VoltageIs14_500();
+  TC_REC_TIM_02_RecoveryWithin90To110ms_When_VoltageIs14_500();
+}
