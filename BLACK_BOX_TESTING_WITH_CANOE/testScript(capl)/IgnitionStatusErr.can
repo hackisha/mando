@@ -1,0 +1,407 @@
+/*@!Encoding:65001*/
+includes { }
+
+variables
+{
+  message Fault_sts_Rsp Fault_sts_Rsp_msg; 
+  message Fault_sts_Req Fault_sts_Req_msg; 
+}
+
+on message Fault_sts_Rsp
+{
+  Fault_sts_Rsp_msg = this;
+}
+
+// -----------------------------------------------------------------
+// Helper Functions
+// -----------------------------------------------------------------
+
+void setupPreCondition(long engineSts, long battPercent, long ignSts)
+{
+  @sysvar::ENG::Sys_ENG_10ms_En = 1;
+  @sysvar::ENG::Sys_IGN_2ms_En = 1;
+  @sysvar::BMS::Sys_BMS_10ms_En = 1;
+  
+  @sysvar::STR::Sys_STR_10ms_En = 0;
+  @sysvar::BRK::Sys_BRK_10ms_En = 0;
+
+  @sysvar::ENG::Sys_Engine_sts = engineSts;
+  @sysvar::BMS::Sys_Batt_Percent = battPercent; 
+  @sysvar::ENG::Sys_Ignition_sts = ignSts;      
+
+  Fault_sts_Req_msg.All_Fault_clr_request = 0;
+  Fault_sts_Req_msg.All_Fault_sts_request = 0;
+  output(Fault_sts_Req_msg);
+
+  testWaitForTimeout(100);
+}
+
+void setIgnitionStatus(long ignSts)
+{
+  @sysvar::ENG::Sys_Ignition_sts = ignSts;
+}
+
+int requestFaultStatus(long timeoutMs)
+{
+  Fault_sts_Req_msg.All_Fault_sts_request = 1;
+  output(Fault_sts_Req_msg);
+
+  if (testWaitForMessage(Fault_sts_Rsp, timeoutMs))
+  {
+    Fault_sts_Req_msg.All_Fault_sts_request = 0;
+    output(Fault_sts_Req_msg);
+    return 1;
+  }
+
+  Fault_sts_Req_msg.All_Fault_sts_request = 0;
+  output(Fault_sts_Req_msg);
+  return 0;
+}
+
+void clearAllFault()
+{
+  Fault_sts_Req_msg.All_Fault_sts_request = 0;
+  Fault_sts_Req_msg.All_Fault_clr_request = 1;
+  output(Fault_sts_Req_msg);
+  testWaitForTimeout(50);
+
+  Fault_sts_Req_msg.All_Fault_clr_request = 0;
+  output(Fault_sts_Req_msg);
+  testWaitForTimeout(50);
+}
+
+int clearAndVerifyNoFault(char stepId[])
+{
+  clearAllFault();
+
+  if (!requestFaultStatus(100))
+  {
+    testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout");
+    return 0;
+  }
+
+  if (Fault_sts_Rsp_msg.IGN_Err_sts != 0)
+  {
+    testStepFail(stepId, "Fail. Expected: 0, Actual: %d", Fault_sts_Rsp_msg.IGN_Err_sts);
+    return 0;
+  }
+
+  testStepPass(stepId, "Pass. Expected: 0, Actual: 0");
+  return 1;
+}
+
+int verifyCurrentIgnStatus(char stepId[], long expected)
+{
+  testWaitForTimeout(20); 
+
+  if (!requestFaultStatus(100))
+  {
+    testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout");
+    return 0;
+  }
+
+  if (Fault_sts_Rsp_msg.IGN_Err_sts != expected)
+  {
+    testStepFail(stepId, "Fail. Expected: %d, Actual: %d", expected, Fault_sts_Rsp_msg.IGN_Err_sts);
+    return 0;
+  }
+
+  testStepPass(stepId, "Pass. Expected: %d, Actual: %d", expected, Fault_sts_Rsp_msg.IGN_Err_sts);
+  return 1;
+}
+
+long measureTimeAfterIgnChange(long ignSts, long targetStatus, long maxWaitMs, long pollMs)
+{
+  dword startTime;
+  dword currentTime;
+  long elapsed;
+
+  startTime = timeNow();
+  setIgnitionStatus(ignSts);
+
+  while (1)
+  {
+    testWaitForTimeout(pollMs); 
+    
+    currentTime = timeNow();
+    elapsed = (currentTime - startTime) / 100;
+
+    if (elapsed > maxWaitMs) break;
+
+    if (requestFaultStatus(50))
+    {
+      if (Fault_sts_Rsp_msg.IGN_Err_sts == targetStatus)
+      {
+        currentTime = timeNow();
+        return (currentTime - startTime) / 100;
+      }
+    }
+  }
+  return -1;
+}
+
+int checkTimeLimit(char stepId[], long measuredMs, long minMs, long maxMs)
+{
+  if (measuredMs < 0)
+  {
+    testStepFail(stepId, "Fail. Expected: Change within %d ms, Actual: Timeout", maxMs);
+    return 0;
+  }
+
+  if (measuredMs < minMs || measuredMs > maxMs)
+  {
+    testStepFail(stepId, "Fail. Expected: %d ~ %d ms, Actual: %d ms", minMs, maxMs, measuredMs);
+    return 0;
+  }
+
+  testStepPass(stepId, "Pass. Expected: %d ~ %d ms, Actual: %d ms", minMs, maxMs, measuredMs);
+  return 1;
+}
+
+int checkStatusNotChangedAtTime(char stepId[], long waitMs, long unexpectedStatus)
+{
+  testWaitForTimeout(20); 
+  testWaitForTimeout(waitMs);
+
+  if (!requestFaultStatus(100))
+  {
+    testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout");
+    return 0;
+  }
+
+  if (Fault_sts_Rsp_msg.IGN_Err_sts == unexpectedStatus)
+  {
+    testStepFail(stepId, "Fail. Expected: NOT %d yet, Actual: %d at %d ms", unexpectedStatus, unexpectedStatus, waitMs);
+    return 0;
+  }
+
+  testStepPass(stepId, "Pass. Expected: NOT %d yet, Actual: %d at %d ms", unexpectedStatus, Fault_sts_Rsp_msg.IGN_Err_sts, waitMs);
+  return 1;
+}
+
+int checkNoFaultForDuration(char stepId[], long totalWaitMs, long pollMs)
+{
+  dword startTime;
+  dword currentTime;
+  long elapsed;
+
+  testWaitForTimeout(20); 
+  startTime = timeNow();
+
+  while (1)
+  {
+    currentTime = timeNow();
+    elapsed = (currentTime - startTime) / 100;
+
+    if (elapsed > totalWaitMs) break;
+
+    if (!requestFaultStatus(100))
+    {
+      testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout at %d ms", elapsed);
+      return 0;
+    }
+
+    if (Fault_sts_Rsp_msg.IGN_Err_sts == 2)
+    {
+      testStepFail(stepId, "Fail. Expected: 0, Actual: 2 (Fault detected early at %d ms)", elapsed);
+      return 0;
+    }
+
+    testWaitForTimeout(pollMs);
+  }
+
+  testStepPass(stepId, "Pass. Expected: 0 for %d ms, Actual: 0", totalWaitMs);
+  return 1;
+}
+
+int setupAndClearFault(char clearStepId[], long engineSts, long battPercent, long ignSts)
+{
+  setupPreCondition(engineSts, battPercent, ignSts);
+
+  if (!clearAndVerifyNoFault(clearStepId)) return 0;
+  return 1;
+}
+
+// -----------------------------------------------------------------
+// Test Cases
+// -----------------------------------------------------------------
+
+testcase TC_PRE_01_NoDetection_When_EngineIsOff()
+{
+  testStep("1.0", "Setup: Engine=0(Off), Batt=60%, IGN=1(On)");
+  if (!setupAndClearFault("1.1", 0, 60, 1)) return;
+
+  testStep("2.0", "Check: Set IGN=3(Error) and wait 120 ms");
+  setIgnitionStatus(3);
+  checkNoFaultForDuration("2.1", 120, 20);
+}
+
+testcase TC_PRE_02_NoDetection_When_BattIs39()
+{
+  testStep("1.0", "Setup: Engine=1(Run), Batt=39%, IGN=1(On)");
+  if (!setupAndClearFault("1.1", 1, 39, 1)) return;
+
+  testStep("2.0", "Check: Set IGN=3(Error) and wait 120 ms");
+  setIgnitionStatus(3);
+  checkNoFaultForDuration("2.1", 120, 20);
+}
+
+testcase TC_PRE_03_NoDetection_When_BattIs81()
+{
+  testStep("1.0", "Setup: Engine=1(Run), Batt=81%, IGN=1(On)");
+  if (!setupAndClearFault("1.1", 1, 81, 1)) return;
+
+  testStep("2.0", "Check: Set IGN=3(Error) and wait 120 ms");
+  setIgnitionStatus(3);
+  checkNoFaultForDuration("2.1", 120, 20);
+}
+
+testcase TC_DET_PRE_BVA_01_FaultDetected_When_BattIs40()
+{
+  testStep("1.0", "Setup: Engine=1(Run), Batt=40% (Min Border), IGN=1(On)");
+  if (!setupAndClearFault("1.1", 1, 40, 1)) return;
+
+  testStep("2.0", "Action: Set IGN=3(Error) and wait 120 ms");
+  setIgnitionStatus(3);
+  testWaitForTimeout(120);
+  
+  verifyCurrentIgnStatus("3.0", 2);
+}
+
+testcase TC_DET_PRE_BVA_02_FaultDetected_When_BattIs80()
+{
+  testStep("1.0", "Setup: Engine=1(Run), Batt=80% (Max Border), IGN=1(On)");
+  if (!setupAndClearFault("1.1", 1, 80, 1)) return;
+
+  testStep("2.0", "Action: Set IGN=3(Error) and wait 120 ms");
+  setIgnitionStatus(3);
+  testWaitForTimeout(120);
+  
+  verifyCurrentIgnStatus("3.0", 2);
+}
+
+testcase TC_DET_COND_01_NoFault_When_IgnIs1()
+{
+  testStep("1.0", "Setup: Engine=1(Run), Batt=60%, IGN=1(On)");
+  if (!setupAndClearFault("1.1", 1, 60, 1)) return;
+
+  testStep("2.0", "Check: Keep IGN=1(Normal) and wait 120 ms");
+  setIgnitionStatus(1);
+  checkNoFaultForDuration("2.1", 120, 20);
+}
+
+testcase TC_DET_COND_02_FaultDetected_When_IgnIs3()
+{
+  testStep("1.0", "Setup: Engine=1(Run), Batt=60%, IGN=1(On)");
+  if (!setupAndClearFault("1.1", 1, 60, 1)) return;
+
+  testStep("2.0", "Action: Set IGN=3(Error) and wait 120 ms");
+  setIgnitionStatus(3);
+  testWaitForTimeout(120);
+  
+  verifyCurrentIgnStatus("3.0", 2);
+}
+
+testcase TC_DET_TIM_01_NoFaultBefore89ms_When_IgnIs3()
+{
+  testStep("1.0", "Setup: Engine=1(Run), Batt=60%, IGN=1(On)");
+  if (!setupAndClearFault("1.1", 1, 60, 1)) return;
+
+  testStep("2.0", "Check: Wait 89 ms (Under limit)");
+  setIgnitionStatus(3);
+  checkStatusNotChangedAtTime("2.1", 89, 2);
+}
+
+testcase TC_DET_TIM_02_FaultWithin90To110ms_When_IgnIs3()
+{
+  long detectMs;
+  testStep("1.0", "Setup: Engine=1(Run), Batt=60%, IGN=1(On)");
+  if (!setupAndClearFault("1.1", 1, 60, 1)) return;
+
+  testStep("2.0", "Measure: Time to reach Level 2");
+  detectMs = measureTimeAfterIgnChange(3, 2, 150, 10);
+  
+  checkTimeLimit("3.0", detectMs, 90, 110);
+  verifyCurrentIgnStatus("3.1", 2);
+}
+
+testcase TC_REC_COND_01_NoRecovery_When_IgnIs3()
+{
+  testStep("1.0", "Action: Create Fault Level 2");
+  if (!setupAndClearFault("1.1", 1, 60, 1)) return;
+  setIgnitionStatus(3);
+  testWaitForTimeout(120);
+  if (!verifyCurrentIgnStatus("1.2", 2)) return;
+
+  testStep("2.0", "Check: Keep IGN=3 (No recovery) and wait 120 ms");
+  setIgnitionStatus(3);
+  testWaitForTimeout(120);
+  
+  verifyCurrentIgnStatus("2.1", 2);
+}
+
+testcase TC_REC_COND_02_Recovery_When_IgnIs1()
+{
+  testStep("1.0", "Action: Create Fault Level 2");
+  if (!setupAndClearFault("1.1", 1, 60, 1)) return;
+  setIgnitionStatus(3);
+  testWaitForTimeout(120);
+  if (!verifyCurrentIgnStatus("1.2", 2)) return;
+
+  testStep("2.0", "Action: Set IGN=1 (Recover) and wait 120 ms");
+  setIgnitionStatus(1);
+  testWaitForTimeout(120);
+
+  verifyCurrentIgnStatus("2.1", 1);
+}
+
+testcase TC_REC_TIM_01_NoRecoveryBefore89ms_When_IgnIs1()
+{
+  testStep("1.0", "Action: Create Fault Level 2");
+  if (!setupAndClearFault("1.1", 1, 60, 1)) return;
+  setIgnitionStatus(3);
+  testWaitForTimeout(120);
+  if (!verifyCurrentIgnStatus("1.2", 2)) return;
+
+  testStep("2.0", "Check: Wait 89 ms (Under limit)");
+  setIgnitionStatus(1);
+  checkStatusNotChangedAtTime("2.1", 89, 1);
+}
+
+testcase TC_REC_TIM_02_RecoveryWithin90To110ms_When_IgnIs1()
+{
+  long recoverMs;
+  testStep("1.0", "Action: Create Fault Level 2");
+  if (!setupAndClearFault("1.1", 1, 60, 1)) return;
+  setIgnitionStatus(3);
+  testWaitForTimeout(120);
+  if (!verifyCurrentIgnStatus("1.2", 2)) return;
+
+  testStep("2.0", "Measure: Time to reach Level 1");
+  recoverMs = measureTimeAfterIgnChange(1, 1, 150, 10);
+  
+  checkTimeLimit("3.0", recoverMs, 90, 110);
+  verifyCurrentIgnStatus("3.1", 1);
+}
+
+void mainTest()
+{
+  testModuleTitle("Req 4: Ignition Status Error Validation (with BVA)");
+
+  TC_PRE_01_NoDetection_When_EngineIsOff();
+  TC_PRE_02_NoDetection_When_BattIs39();
+  TC_PRE_03_NoDetection_When_BattIs81();
+  
+  TC_DET_PRE_BVA_01_FaultDetected_When_BattIs40();
+  TC_DET_PRE_BVA_02_FaultDetected_When_BattIs80();
+
+  TC_DET_COND_01_NoFault_When_IgnIs1();
+  TC_DET_COND_02_FaultDetected_When_IgnIs3();
+  TC_DET_TIM_01_NoFaultBefore89ms_When_IgnIs3();
+  TC_DET_TIM_02_FaultWithin90To110ms_When_IgnIs3();
+
+  TC_REC_COND_01_NoRecovery_When_IgnIs3();
+  TC_REC_COND_02_Recovery_When_IgnIs1();
+  TC_REC_TIM_01_NoRecoveryBefore89ms_When_IgnIs1();
+  TC_REC_TIM_02_RecoveryWithin90To110ms_When_IgnIs1();
+}
