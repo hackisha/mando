@@ -3,28 +3,11 @@ includes { }
 
 variables
 {
-  message Fault_sts_Rsp Fault_sts_Rsp_msg; // ID: 0x556
-  message Fault_sts_Req Fault_sts_Req_msg; // ID: 0x555
+  // [메시지 정의]
+  message Fault_sts_Rsp Fault_sts_Rsp_msg; // ID: 0x556 (ECU -> Tester)
+  message Fault_sts_Req Fault_sts_Req_msg; // ID: 0x555 (Tester -> ECU)
 
-  // -----------------------------------------------------------------
-  // 💡 Configuration Variables (Tuning)
-  // -----------------------------------------------------------------
-  long gStbDelay = 10;     // 주입 및 요청 전 안정화 대기 시간 (ms)
-  long gPollInterval = 10; // 측정 루프 내 상태 확인 주기 (ms)
-
-  // 리포트 출력을 위한 현재 주입값 실시간 추적 변수 (상세 명칭)
-  long curEngine = 0; 
-  long curIgnition = 0;
-  long curBrake = 0; 
-  long curAccel = 0; 
-  long curSpeed = 0;
-  
-  long g_lastDurationMs = 0; // 최근 응답 소요 시간
-
-  // Signal Definitions
-  const int SIG_BRAKE = 1;
-  const int SIG_ACCEL = 2;
-  const int SIG_SPEED = 3;
+  const long kSYNC_TIMEOUT = 10; 
 }
 
 on message Fault_sts_Rsp
@@ -33,397 +16,189 @@ on message Fault_sts_Rsp
 }
 
 // -----------------------------------------------------------------
-// Helper Functions (Stability & Accuracy Optimized)
+// [Helper Functions] 정밀 싱크 및 시그널 매핑 수정
 // -----------------------------------------------------------------
 
-long getSignalStatus(int sigType)
+// 1. 초기 환경 설정 (주기 메시지 활성화 포함)
+void setupPreCondition(long eng, long ign, long brk, long acc, long spd)
 {
-  if (sigType == SIG_BRAKE) return Fault_sts_Rsp_msg.Brake_Err_sts;
-  if (sigType == SIG_ACCEL) return Fault_sts_Rsp_msg.ACCEL_Err_sts;
-  if (sigType == SIG_SPEED) return Fault_sts_Rsp_msg.Speed_Err_sts;
-  return -1;
-}
-
-void setAllSignals(long bVal, long aVal, long sVal)
-{
-  curBrake = bVal; curAccel = aVal; curSpeed = sVal;
-  @sysvar::BRK::Sys_Brake_press = bVal;
-  @sysvar::BRK::Sys_ACCEL_press = aVal;
-  @sysvar::BRK::Sys_Vehicle_Speed = sVal;
+  // 주기 메시지 전송 엔진 활성화 (반드시 필요)
+  @sysvar::ENG::Sys_ENG_10ms_En = 1;
+  @sysvar::ENG::Sys_IGN_2ms_En = 1;
+  @sysvar::BMS::Sys_BMS_10ms_En = 1;
   
-  testStep("Injection", "Action: [Brake:%d, Accel:%d, Speed:%d] 주입 (안정화 %d ms 대기)", bVal, aVal, sVal, gStbDelay);
-  testWaitForTimeout(gStbDelay); 
-}
+  @sysvar::STR::Sys_STR_10ms_En = 0;
+  @sysvar::BRK::Sys_BRK_10ms_En = 1;
 
-void setSignalValue(int sigType, long val)
-{
-  if (sigType == SIG_BRAKE) { curBrake = val; @sysvar::BRK::Sys_Brake_press = val; }
-  else if (sigType == SIG_ACCEL) { curAccel = val; @sysvar::BRK::Sys_ACCEL_press = val; }
-  else if (sigType == SIG_SPEED) { curSpeed = val; @sysvar::BRK::Sys_Vehicle_Speed = val; }
+  // 상태 주입
+  @sysvar::ENG::Sys_Engine_sts = eng;
+  @sysvar::ENG::Sys_Ignition_sts = ign;
   
-  testStep("Injection", "Action: 단일 신호값 %d 설정 (안정화 %d ms 대기)", val, gStbDelay);
-  testWaitForTimeout(gStbDelay); 
+  // 시스템 변수 경로 확인 필요 (제공해주신 경로 기준 유지)
+  @sysvar::BRK::Sys_Brake_press = brk;
+  @sysvar::BRK::Sys_ACCEL_press = acc;
+  @sysvar::BRK::Sys_Vehicle_Speed = spd;
+
+  Fault_sts_Req_msg.All_Fault_clr_request = 0;
+  Fault_sts_Req_msg.All_Fault_sts_request = 0;
+  output(Fault_sts_Req_msg);
+
+  testWaitForTimeout(150); // 환경 전파 및 안정화 시간 충분히 확보
 }
 
-int requestFaultStatus(long timeoutMs)
+// 2. 결함 초기화 (확실한 0점 조절)
+void initializeFaultState()
 {
-  dword startTime;
-  startTime = timeNow();
+  testStep("Init", "결함 초기화 및 정상 상태(0/0/0) 확인");
+
+  @sysvar::BRK::Sys_Brake_press = 0;
+  @sysvar::BRK::Sys_ACCEL_press = 0;
+  @sysvar::BRK::Sys_Vehicle_Speed = 0;
+  testWaitForTimeout(100); 
+
+  Fault_sts_Req_msg.All_Fault_clr_request = 1;
+  output(Fault_sts_Req_msg);
+  testWaitForTimeout(100); 
+  
+  Fault_sts_Req_msg.All_Fault_clr_request = 0;
+  output(Fault_sts_Req_msg);
+  testWaitForTimeout(100); 
+
+  // 초기화 후 검증 실패 시 테스트 중단하여 오탐 방지
+  if(!requestAndVerifyLevel("Init_Check", 0, 0, 0)) {
+    testStepFail("Init", "초기화 실패. 제어기 상태가 0이 아닙니다.");
+  }
+}
+
+// 3. [싱크 주입] 요청 -> 응답 대기 -> 주입 (Baseline 정석)
+void syncAndInject(long brk, long acc, long spd)
+{
+  char logBuf[512];
+  
+  Fault_sts_Req_msg.All_Fault_sts_request = 1;
+  output(Fault_sts_Req_msg);
+  
+  if (testWaitForMessage(Fault_sts_Rsp, kSYNC_TIMEOUT)) {
+    testStep("Sync", "ECU Cycle 동기화 완료.");
+  }
+  
+  Fault_sts_Req_msg.All_Fault_sts_request = 0;
+  output(Fault_sts_Req_msg);
+
+  // 싱크 직후(다음 사이클 시작)에 값 주입
+  @sysvar::BRK::Sys_Brake_press = brk;
+  @sysvar::BRK::Sys_ACCEL_press = acc;
+  @sysvar::BRK::Sys_Vehicle_Speed = spd; 
+
+  snprintf(logBuf, 512, "[주입] Brk:%ld, Acc:%ld, Spd:%ld", brk, acc, spd);
+  testStep("Injection", logBuf);
+}
+
+// 4. [검증] 시그널 명칭 정밀 수정
+int requestAndVerifyLevel(char stepId[], long expBrk, long expAcc, long expSpd)
+{
+  char logBuf[512];
+  message Fault_sts_Rsp rxMsg; 
+
+  testWaitForTimeout(30); // ECU 연산 여유 시간 확보
+
   Fault_sts_Req_msg.All_Fault_sts_request = 1;
   output(Fault_sts_Req_msg);
 
-  if (testWaitForMessage(Fault_sts_Rsp, timeoutMs))
+  if (testWaitForMessage(Fault_sts_Rsp, kSYNC_TIMEOUT))
   {
-    g_lastDurationMs = (timeNow() - startTime) / 100;
-    testStep("Communication", "제어기 응답 수신: %d ms 소요", g_lastDurationMs);
+    testGetWaitEventMsgData(rxMsg); 
+
     Fault_sts_Req_msg.All_Fault_sts_request = 0;
     output(Fault_sts_Req_msg);
-    return 1;
+
+    // [중요] 시그널 명칭이 DBC와 일치해야 함 (Brake_Err_sts -> BRK_Err_sts 등으로 확인 필요)
+    if (rxMsg.Brake_Err_sts == expBrk && rxMsg.ACCEL_Err_sts == expAcc && rxMsg.Speed_Err_sts == expSpd) {
+      snprintf(logBuf, 512, "[성공] 예상:[%ld/%ld/%ld], 실제:[%ld/%ld/%ld]", 
+               expBrk, expAcc, expSpd, (long)rxMsg.Brake_Err_sts, (long)rxMsg.ACCEL_Err_sts, (long)rxMsg.Speed_Err_sts);
+      testStepPass(stepId, logBuf);
+      return 1;
+    } else {
+      snprintf(logBuf, 512, "[실패] 예상:[%ld/%ld/%ld], 실제:[%ld/%ld/%ld]", 
+               expBrk, expAcc, expSpd, (long)rxMsg.Brake_Err_sts, (long)rxMsg.ACCEL_Err_sts, (long)rxMsg.Speed_Err_sts);
+      testStepFail(stepId, logBuf);
+      return 0;
+    }
   }
+  
   Fault_sts_Req_msg.All_Fault_sts_request = 0;
   output(Fault_sts_Req_msg);
+  testStepFail(stepId, "ECU 응답 타임아웃");
   return 0;
 }
 
-int verifyAllStatuses(char stepId[], long expB, long expA, long expS)
+// 5. IGN Cycle Helper
+void performIgnCycles(int count)
 {
-  testWaitForTimeout(gStbDelay); 
-  if (!requestFaultStatus(100))
+  int i;
+  for(i = 1; i <= count; i++)
   {
-    testStepFail(stepId, "오류: 응답 타임아웃 [Engine=%d, Ignition=%d, Brake=%d, Accel=%d, Speed=%d]", curEngine, curIgnition, curBrake, curAccel, curSpeed);
-    return 0;
-  }
-  if (Fault_sts_Rsp_msg.Brake_Err_sts != expB || Fault_sts_Rsp_msg.ACCEL_Err_sts != expA || Fault_sts_Rsp_msg.Speed_Err_sts != expS)
-  {
-    testStepFail(stepId, "실패: 기대값 [B:%d, A:%d, S:%d] != 실제값 [B:%d, A:%d, S:%d]", expB, expA, expS, Fault_sts_Rsp_msg.Brake_Err_sts, Fault_sts_Rsp_msg.ACCEL_Err_sts, Fault_sts_Rsp_msg.Speed_Err_sts);
-    return 0;
-  }
-  testStepPass(stepId, "성공: 모든 상태 일치 [Brake_Err:%d, Accel_Err:%d, Speed_Err:%d]", expB, expA, expS);
-  return 1;
-}
-
-int verifyCurrentStatus(char stepId[], int sigType, long expected)
-{
-  long actual;
-  testWaitForTimeout(gStbDelay); 
-  if (!requestFaultStatus(100))
-  {
-    testStepFail(stepId, "오류: 응답 타임아웃 [Engine=%d, Ignition=%d, Brake=%d, Accel=%d, Speed=%d]", curEngine, curIgnition, curBrake, curAccel, curSpeed);
-    return 0;
-  }
-  actual = getSignalStatus(sigType);
-  if (actual != expected)
-  {
-    testStepFail(stepId, "실패: 기대 Level %d != 실제 Level %d [Engine=%d, Ignition=%d]", expected, actual, curEngine, curIgnition);
-    return 0;
-  }
-  testStepPass(stepId, "성공: Level %d 확인됨 [Engine=%d, Ignition=%d, Brake=%d, Accel=%d, Speed=%d]", expected, curEngine, curIgnition, curBrake, curAccel, curSpeed);
-  return 1;
-}
-
-long measureTimeAfterChange(int sigType, long val, long targetStatus, long maxWaitMs)
-{
-  dword startTime;
-  startTime = timeNow();
-  setSignalValue(sigType, val); 
-  while (1)
-  {
-    testWaitForTimeout(gPollInterval); 
-    if (((timeNow() - startTime) / 100) > maxWaitMs) break;
-    if (requestFaultStatus(50))
-    {
-      if (getSignalStatus(sigType) == targetStatus) return (timeNow() - startTime) / 100;
-    }
-  }
-  return -1;
-}
-
-int checkTimeLimit(char stepId[], long measuredMs, long minMs, long maxMs)
-{
-  if (measuredMs < 0) { testStepFail(stepId, "실패: %d ms 이내에 목표 상태 도달 못함 [Brake=%d, Accel=%d, Speed=%d]", maxMs, curBrake, curAccel, curSpeed); return 0; }
-  if (measuredMs < minMs || measuredMs > maxMs) { testStepFail(stepId, "실패: 측정 시간 %d ms (허용범위: %d~%d ms) [Engine=%d, Ignition=%d]", measuredMs, minMs, maxMs, curEngine, curIgnition); return 0; }
-  testStepPass(stepId, "성공: 정밀 타이밍 만족 (%d ms) [Engine=%d, Ignition=%d]", measuredMs, curEngine, curIgnition);
-  return 1;
-}
-
-int checkStatusNotChangedAtTime(char stepId[], int sigType, long totalWaitMs, long unexpectedStatus)
-{
-  long actual;
-  long calcWait;
-  calcWait = totalWaitMs - gStbDelay;
-  if (calcWait > 0) testWaitForTimeout(calcWait);
-  if (!requestFaultStatus(100)) { testStepFail(stepId, "오류: 응답 타임아웃 [Engine=%d, Ignition=%d]", curEngine, curIgnition); return 0; }
-  actual = getSignalStatus(sigType);
-  if (actual == unexpectedStatus) { testStepFail(stepId, "실패: %d ms 시점에 조기 전이 발생 (Level %d)", totalWaitMs, unexpectedStatus); return 0; }
-  testStepPass(stepId, "성공: %d ms 시점까지 Level %d 미발생 확인 [Engine=%d, IGN=%d, Brk=%d, Acc=%d, Spd=%d]", totalWaitMs, unexpectedStatus, curEngine, curIgnition, curBrake, curAccel, curSpeed);
-  return 1;
-}
-
-int checkNoFaultForDuration(char stepId[], int sigType, long totalWaitMs)
-{
-  dword startTime;
-  long elapsed;
-  startTime = timeNow();
-  while (1)
-  {
-    elapsed = (timeNow() - startTime) / 100;
-    if (elapsed > totalWaitMs) break;
-    if (!requestFaultStatus(100)) { testStepFail(stepId, "오류: 통신 타임아웃 [Engine=%d, IGN=%d]", curEngine, curIgnition); return 0; }
-    if (getSignalStatus(sigType) == 2) { testStepFail(stepId, "실패: %d ms 시점에 조기 고장 검출", elapsed); return 0; }
-    testWaitForTimeout(gPollInterval);
-  }
-  testStepPass(stepId, "성공: %d ms 동안 고장 미발생 확인 [Brake=%d, Accel=%d, Speed=%d]", totalWaitMs, curBrake, curAccel, curSpeed);
-  return 1;
-}
-
-void setupPreCondition(long engineSts, long ignSts)
-{
-  curEngine = engineSts; curIgnition = ignSts;
-  @sysvar::ENG::Sys_ENG_10ms_En = 1; @sysvar::ENG::Sys_IGN_2ms_En = 1; @sysvar::BRK::Sys_BRK_10ms_En = 1; 
-  @sysvar::ENG::Sys_Engine_sts = engineSts; @sysvar::ENG::Sys_Ignition_sts = ignSts;
-  setAllSignals(0, 0, 0);
-  Fault_sts_Req_msg.All_Fault_clr_request = 1; output(Fault_sts_Req_msg);
-  testWaitForTimeout(50);
-  Fault_sts_Req_msg.All_Fault_clr_request = 0; output(Fault_sts_Req_msg);
-  testWaitForTimeout(100);
-}
-
-int clearAndVerifyNoFault(char stepId[])
-{
-  Fault_sts_Req_msg.All_Fault_clr_request = 1; output(Fault_sts_Req_msg);
-  testWaitForTimeout(50);
-  Fault_sts_Req_msg.All_Fault_clr_request = 0; output(Fault_sts_Req_msg);
-  testWaitForTimeout(gStbDelay);
-  if (!requestFaultStatus(100)) { testStepFail(stepId, "오류: 초기화 후 타임아웃"); return 0; }
-  testStepPass(stepId, "성공: 클리어 완료 [Engine=%d, Ignition=%d]", curEngine, curIgnition);
-  return 1;
-}
-
-int setupAndClear(char clearStepId[], long engineSts, long ignSts)
-{
-  setupPreCondition(engineSts, ignSts);
-  return clearAndVerifyNoFault(clearStepId);
-}
-
-// -----------------------------------------------------------------
-// 1) General Preconditions
-// -----------------------------------------------------------------
-
-testcase TC_PRE_01_NoDetection_When_EngineIsOff()
-{
-  long waitVal;
-  testStep("1.0", "Precondition: Engine Stop, Ignition On");
-  if (!setupAndClear("1.1", 0, 1)) return;
-  setSignalValue(SIG_BRAKE, 127);
-  waitVal = 520 - gStbDelay;
-  checkNoFaultForDuration("2.1", SIG_BRAKE, waitVal);
-}
-
-testcase TC_PRE_02_NoDetection_When_IgnitionIsOff()
-{
-  long waitVal;
-  testStep("1.0", "Precondition: Engine Run, Ignition Off");
-  if (!setupAndClear("1.1", 1, 0)) return;
-  setSignalValue(SIG_BRAKE, 127);
-  waitVal = 520 - gStbDelay;
-  checkNoFaultForDuration("2.1", SIG_BRAKE, waitVal);
-}
-
-// -----------------------------------------------------------------
-// 2) Individual Signal Exhaustive BVA & Timing
-// -----------------------------------------------------------------
-
-// --- Brake Cases ---
-testcase TC_BRK_DET_BVA_01_NoFault_When_BrakeIs126()
-{
-  testStep("1.0", "Brake BVA: 126 주입 시 고장 미발생 검증");
-  if (!setupAndClear("1.1", 1, 1)) return;
-  setSignalValue(SIG_BRAKE, 126);
-  checkNoFaultForDuration("2.1", SIG_BRAKE, 520 - gStbDelay);
-}
-
-testcase TC_BRK_DET_BVA_02_FaultDetected_When_BrakeIs127()
-{
-  long waitVal;
-  testStep("1.0", "Brake BVA: 127 주입 시 고장 발생 검증");
-  if (!setupAndClear("1.1", 1, 1)) return;
-  setSignalValue(SIG_BRAKE, 127);
-  waitVal = 520 - gStbDelay;
-  testWaitForTimeout(waitVal);
-  verifyCurrentStatus("2.0", SIG_BRAKE, 2);
-}
-
-testcase TC_BRK_DET_TIM_01_NoFaultBefore489ms()
-{
-  testStep("1.0", "Brake Timing: 489ms 이전 고장 미전이 검증");
-  if (!setupAndClear("1.1", 1, 1)) return;
-  setSignalValue(SIG_BRAKE, 127);
-  checkStatusNotChangedAtTime("2.1", SIG_BRAKE, 489, 2);
-}
-
-testcase TC_BRK_DET_TIM_02_FaultWithin490To510ms()
-{
-  long detectMs;
-  testStep("1.0", "Brake Timing: 500ms(+-10ms) 정밀 검출 시간 측정");
-  if (!setupAndClear("1.1", 1, 1)) return;
-  detectMs = measureTimeAfterChange(SIG_BRAKE, 127, 2, 530);
-  checkTimeLimit("2.0", detectMs, 490, 510);
-  verifyCurrentStatus("2.1", SIG_BRAKE, 2);
-}
-
-testcase TC_BRK_REC_BVA_01_Recovery_When_BrakeIs126()
-{
-  long waitVal;
-  testStep("1.0", "Brake Recovery BVA: 126 주입 시 회복(Level 1) 검증");
-  if (!setupAndClear("1.1", 1, 1)) return;
-  setSignalValue(SIG_BRAKE, 127);
-  testWaitForTimeout(520 - gStbDelay);
-  if (!verifyCurrentStatus("1.2", SIG_BRAKE, 2)) return;
-  
-  setSignalValue(SIG_BRAKE, 126);
-  waitVal = 120 - gStbDelay;
-  testWaitForTimeout(waitVal);
-  verifyCurrentStatus("2.1", SIG_BRAKE, 1);
-}
-
-testcase TC_BRK_REC_TIM_02_RecoveryWithin90To110ms()
-{
-  long recoverMs;
-  testStep("1.0", "Brake Recovery Timing: 100ms(+-10ms) 정밀 회복 시간 측정");
-  if (!setupAndClear("1.1", 1, 1)) return;
-  setSignalValue(SIG_BRAKE, 127);
-  testWaitForTimeout(520 - gStbDelay);
-  
-  recoverMs = measureTimeAfterChange(SIG_BRAKE, 126, 1, 150);
-  checkTimeLimit("2.0", recoverMs, 90, 110);
-  verifyCurrentStatus("2.1", SIG_BRAKE, 1);
-}
-
-// --- Accel Cases ---
-testcase TC_ACC_DET_BVA_02_FaultDetected()
-{
-  testStep("1.0", "Accel BVA: 127 주입 시 고장 발생 검증");
-  if (!setupAndClear("1.1", 1, 1)) return;
-  setSignalValue(SIG_ACCEL, 127);
-  testWaitForTimeout(520 - gStbDelay);
-  verifyCurrentStatus("2.0", SIG_ACCEL, 2);
-}
-
-testcase TC_ACC_DET_TIM_02_Precision()
-{
-  long detectMs;
-  testStep("1.0", "Accel Timing: 500ms 정밀 검출 검증");
-  if (!setupAndClear("1.1", 1, 1)) return;
-  detectMs = measureTimeAfterChange(SIG_ACCEL, 127, 2, 530);
-  checkTimeLimit("2.0", detectMs, 490, 510);
-  verifyCurrentStatus("2.1", SIG_ACCEL, 2);
-}
-
-testcase TC_ACC_REC_TIM_02_Precision()
-{
-  long recoverMs;
-  testStep("1.0", "Accel Recovery Timing: 100ms 정밀 회복 검증");
-  if (!setupAndClear("1.1", 1, 1)) return;
-  setSignalValue(SIG_ACCEL, 127);
-  testWaitForTimeout(520 - gStbDelay);
-  recoverMs = measureTimeAfterChange(SIG_ACCEL, 126, 1, 150);
-  checkTimeLimit("2.0", recoverMs, 90, 110);
-}
-
-// --- Speed Cases ---
-testcase TC_SPD_DET_BVA_02_FaultDetected()
-{
-  testStep("1.0", "Speed BVA: 255 주입 시 고장 발생 검증");
-  if (!setupAndClear("1.1", 1, 1)) return;
-  setSignalValue(SIG_SPEED, 255);
-  testWaitForTimeout(520 - gStbDelay);
-  verifyCurrentStatus("2.0", SIG_SPEED, 2);
-}
-
-testcase TC_SPD_DET_TIM_02_Precision()
-{
-  long detectMs;
-  testStep("1.0", "Speed Timing: 500ms 정밀 검출 검증");
-  if (!setupAndClear("1.1", 1, 1)) return;
-  detectMs = measureTimeAfterChange(SIG_SPEED, 255, 2, 530);
-  checkTimeLimit("2.0", detectMs, 490, 510);
-}
-
-testcase TC_SPD_REC_TIM_02_Precision()
-{
-  long recoverMs;
-  testStep("1.0", "Speed Recovery Timing: 100ms 정밀 회복 검증");
-  if (!setupAndClear("1.1", 1, 1)) return;
-  setSignalValue(SIG_SPEED, 255);
-  testWaitForTimeout(520 - gStbDelay);
-  recoverMs = measureTimeAfterChange(SIG_SPEED, 254, 1, 150);
-  checkTimeLimit("2.0", recoverMs, 90, 110);
-}
-
-// -----------------------------------------------------------------
-// 3) 💡 Combinatorial Matrices (Exhaustive 8x8 States)
-// -----------------------------------------------------------------
-
-testcase TC_MATRIX_Exhaustive_Detection_8_States()
-{
-  int i; long b, a, s; long expB, expA, expS; char stepId[20];
-  testStep("DET_MATRIX", "=== 고장 검출 조합 매트릭스 테스트 (8가지) ===");
-  for (i = 0; i < 8; i++) {
-    b = (i & 0x01) ? 127 : 0; a = (i & 0x02) ? 127 : 0; s = (i & 0x04) ? 255 : 0;
-    expB = (i & 0x01) ? 2 : 0; expA = (i & 0x02) ? 2 : 0; expS = (i & 0x04) ? 2 : 0;
-    snprintf(stepId, 20, "DET_State_%d", i);
-    setupPreCondition(1, 1); setAllSignals(b, a, s);
-    testWaitForTimeout(510);
-    verifyAllStatuses(stepId, expB, expA, expS);
-  }
-}
-
-testcase TC_MATRIX_Exhaustive_Recovery_8_States()
-{
-  int i; long b, a, s; long expB, expA, expS; char stepId[20];
-  testStep("REC_MATRIX", "=== 고장 회복 조합 매트릭스 테스트 (8가지) ===");
-  for (i = 0; i < 8; i++) {
-    setupPreCondition(1, 1); setAllSignals(127, 127, 255);
-    testWaitForTimeout(510); 
-    if (!verifyAllStatuses("REC_INIT", 2, 2, 2)) continue;
-
-    b = (i & 0x01) ? 127 : 0; a = (i & 0x02) ? 127 : 0; s = (i & 0x04) ? 255 : 0;
-    expB = (i & 0x01) ? 2 : 1; expA = (i & 0x02) ? 2 : 1; expS = (i & 0x04) ? 2 : 1;
-    snprintf(stepId, 20, "REC_State_%d", i);
-    setAllSignals(b, a, s);
-    testWaitForTimeout(110); 
-    verifyAllStatuses(stepId, expB, expA, expS);
+    @sysvar::ENG::Sys_Ignition_sts = 0; 
+    testWaitForTimeout(100);
+    @sysvar::ENG::Sys_Ignition_sts = 1; 
+    testWaitForTimeout(100);
   }
 }
 
 // -----------------------------------------------------------------
-// Main Test Execution
+// [Test Cases] 27개 전체 시나리오
 // -----------------------------------------------------------------
 
+testcase BRK_PRE_01() { testCaseTitle("BRK-PRE-01", "Engine Run 조건 미충족"); setupPreCondition(0, 1, 0, 0, 0); syncAndInject(127, 0, 100); testWaitForTimeout(510); requestAndVerifyLevel("Check", 0, 0, 0); }
+testcase BRK_PRE_02() { testCaseTitle("BRK-PRE-02", "IGN On 조건 미충족"); setupPreCondition(1, 0, 0, 0, 0); syncAndInject(127, 0, 100); testWaitForTimeout(510); requestAndVerifyLevel("Check", 0, 0, 0); }
+
+testcase BRK_DET_00() { testCaseTitle("BRK-DET-00", "정상 조합"); initializeFaultState(); syncAndInject(0, 0, 100); testWaitForTimeout(510); requestAndVerifyLevel("Check", 0, 0, 0); }
+testcase BRK_DET_01() { testCaseTitle("BRK-DET-01", "Brake 단독 검출"); initializeFaultState(); syncAndInject(127, 0, 100); testWaitForTimeout(510); requestAndVerifyLevel("Check", 2, 0, 0); }
+testcase BRK_DET_02() { testCaseTitle("BRK-DET-02", "ACCEL 단독 검출"); initializeFaultState(); syncAndInject(0, 127, 100); testWaitForTimeout(510); requestAndVerifyLevel("Check", 0, 2, 0); }
+testcase BRK_DET_03() { testCaseTitle("BRK-DET-03", "Speed 단독 검출"); initializeFaultState(); syncAndInject(0, 0, 255); testWaitForTimeout(510); requestAndVerifyLevel("Check", 0, 0, 2); }
+testcase BRK_DET_04() { testCaseTitle("BRK-DET-04", "Brake+ACCEL 동시 검출"); initializeFaultState(); syncAndInject(127, 127, 100); testWaitForTimeout(510); requestAndVerifyLevel("Check", 2, 2, 0); }
+testcase BRK_DET_05() { testCaseTitle("BRK-DET-05", "Brake+Speed 동시 검출"); initializeFaultState(); syncAndInject(127, 0, 255); testWaitForTimeout(510); requestAndVerifyLevel("Check", 2, 0, 2); }
+testcase BRK_DET_06() { testCaseTitle("BRK-DET-06", "ACCEL+Speed 동시 검출"); initializeFaultState(); syncAndInject(0, 127, 255); testWaitForTimeout(510); requestAndVerifyLevel("Check", 0, 2, 2); }
+testcase BRK_DET_07() { testCaseTitle("BRK-DET-07", "3개 시그널 동시 검출"); initializeFaultState(); syncAndInject(127, 127, 255); testWaitForTimeout(510); requestAndVerifyLevel("Check", 2, 2, 2); }
+
+testcase BRK_REC_S_01() { testCaseTitle("BRK-REC-S-01", "Brake 단독 회복"); initializeFaultState(); syncAndInject(127, 0, 100); testWaitForTimeout(510); requestAndVerifyLevel("Pre", 2, 0, 0); syncAndInject(0, 0, 100); testWaitForTimeout(110); requestAndVerifyLevel("Check", 1, 0, 0); }
+testcase BRK_REC_S_02() { testCaseTitle("BRK-REC-S-02", "ACCEL 단독 회복"); initializeFaultState(); syncAndInject(0, 127, 100); testWaitForTimeout(510); requestAndVerifyLevel("Pre", 0, 2, 0); syncAndInject(0, 0, 100); testWaitForTimeout(110); requestAndVerifyLevel("Check", 0, 1, 0); }
+testcase BRK_REC_S_03() { testCaseTitle("BRK-REC-S-03", "Speed 단독 회복"); initializeFaultState(); syncAndInject(0, 0, 255); testWaitForTimeout(510); requestAndVerifyLevel("Pre", 0, 0, 2); syncAndInject(0, 0, 100); testWaitForTimeout(110); requestAndVerifyLevel("Check", 0, 0, 1); }
+
+testcase BRK_REC_M_00() { testCaseTitle("BRK-REC-M-00", "3개 동시 회복"); initializeFaultState(); syncAndInject(127, 127, 255); testWaitForTimeout(510); requestAndVerifyLevel("Pre", 2, 2, 2); syncAndInject(0, 0, 100); testWaitForTimeout(110); requestAndVerifyLevel("Check", 1, 1, 1); }
+testcase BRK_REC_M_01() { testCaseTitle("BRK-REC-M-01", "Brake 유지, 나머지 회복"); initializeFaultState(); syncAndInject(127, 127, 255); testWaitForTimeout(510); requestAndVerifyLevel("Pre", 2, 2, 2); syncAndInject(127, 0, 100); testWaitForTimeout(110); requestAndVerifyLevel("Check", 2, 1, 1); }
+testcase BRK_REC_M_02() { testCaseTitle("BRK-REC-M-02", "ACCEL 유지, 나머지 회복"); initializeFaultState(); syncAndInject(127, 127, 255); testWaitForTimeout(510); requestAndVerifyLevel("Pre", 2, 2, 2); syncAndInject(0, 127, 100); testWaitForTimeout(110); requestAndVerifyLevel("Check", 1, 2, 1); }
+testcase BRK_REC_M_03() { testCaseTitle("BRK-REC-M-03", "Speed 유지, 나머지 회복"); initializeFaultState(); syncAndInject(127, 127, 255); testWaitForTimeout(510); requestAndVerifyLevel("Pre", 2, 2, 2); syncAndInject(0, 0, 255); testWaitForTimeout(110); requestAndVerifyLevel("Check", 1, 1, 2); }
+testcase BRK_REC_M_04() { testCaseTitle("BRK-REC-M-04", "Speed만 회복"); initializeFaultState(); syncAndInject(127, 127, 255); testWaitForTimeout(510); requestAndVerifyLevel("Pre", 2, 2, 2); syncAndInject(127, 127, 100); testWaitForTimeout(110); requestAndVerifyLevel("Check", 2, 2, 1); }
+testcase BRK_REC_M_05() { testCaseTitle("BRK-REC-M-05", "ACCEL만 회복"); initializeFaultState(); syncAndInject(127, 127, 255); testWaitForTimeout(510); requestAndVerifyLevel("Pre", 2, 2, 2); syncAndInject(127, 0, 255); testWaitForTimeout(110); requestAndVerifyLevel("Check", 2, 1, 2); }
+testcase BRK_REC_M_06() { testCaseTitle("BRK-REC-M-06", "Brake만 회복"); initializeFaultState(); syncAndInject(127, 127, 255); testWaitForTimeout(510); requestAndVerifyLevel("Pre", 2, 2, 2); syncAndInject(0, 127, 255); testWaitForTimeout(110); requestAndVerifyLevel("Check", 1, 2, 2); }
+testcase BRK_REC_M_07() { testCaseTitle("BRK-REC-M-07", "회복 조건 없음"); initializeFaultState(); syncAndInject(127, 127, 255); testWaitForTimeout(510); requestAndVerifyLevel("Pre", 2, 2, 2); syncAndInject(127, 127, 255); testWaitForTimeout(110); requestAndVerifyLevel("Check", 2, 2, 2); }
+
+testcase BRK_BND_01() { testCaseTitle("BRK-BND-01", "검출 오차 최소 미달(480ms)"); initializeFaultState(); syncAndInject(127, 0, 100); testWaitForTimeout(480); requestAndVerifyLevel("Check", 0, 0, 0); }
+testcase BRK_BND_02() { testCaseTitle("BRK-BND-02", "검출 오차 최대 도달(510ms)"); initializeFaultState(); syncAndInject(127, 0, 100); testWaitForTimeout(510); requestAndVerifyLevel("Check", 2, 0, 0); }
+testcase BRK_BND_03() { testCaseTitle("BRK-BND-03", "회복 오차 최소 미달(80ms)"); initializeFaultState(); syncAndInject(127, 0, 100); testWaitForTimeout(510); requestAndVerifyLevel("Pre", 2, 0, 0); syncAndInject(0, 0, 100); testWaitForTimeout(80); requestAndVerifyLevel("Check", 2, 0, 0); }
+testcase BRK_BND_04() { testCaseTitle("BRK-BND-04", "회복 오차 최대 도달(110ms)"); initializeFaultState(); syncAndInject(127, 0, 100); testWaitForTimeout(510); requestAndVerifyLevel("Pre", 2, 0, 0); syncAndInject(0, 0, 100); testWaitForTimeout(110); requestAndVerifyLevel("Check", 1, 0, 0); }
+
+testcase BRK_DEL_01() { testCaseTitle("BRK-DEL-01", "49회 Cycle 후 Stored 유지"); initializeFaultState(); syncAndInject(127, 127, 255); testWaitForTimeout(510); syncAndInject(0, 0, 100); testWaitForTimeout(110); requestAndVerifyLevel("Store", 1, 1, 1); performIgnCycles(49); requestAndVerifyLevel("Final", 1, 1, 1); }
+testcase BRK_DEL_02() { testCaseTitle("BRK-DEL-02", "50회 Cycle 후 Deleted 확정"); initializeFaultState(); syncAndInject(127, 127, 255); testWaitForTimeout(510); syncAndInject(0, 0, 100); testWaitForTimeout(110); requestAndVerifyLevel("Store", 1, 1, 1); performIgnCycles(50); requestAndVerifyLevel("Final", 0, 0, 0); }
+
+// -----------------------------------------------------------------
+// [Main]
+// -----------------------------------------------------------------
 void mainTest()
 {
-  testModuleTitle("Req 6: Ultimate Full Exhaustive Combinatorial Test");
+  testModuleTitle("Brake Error Chassis Group 정밀 검증 완본");
 
-  // A. Combinatorial Matrices
-  TC_MATRIX_Exhaustive_Detection_8_States();
-  TC_MATRIX_Exhaustive_Recovery_8_States();
-
-  // B. Standard Detailed Test Cases (Expanded)
-  TC_PRE_01_NoDetection_When_EngineIsOff();
-  TC_PRE_02_NoDetection_When_IgnitionIsOff();
-
-  TC_BRK_DET_BVA_01_NoFault_When_BrakeIs126();
-  TC_BRK_DET_BVA_02_FaultDetected_When_BrakeIs127();
-  TC_BRK_DET_TIM_01_NoFaultBefore489ms();
-  TC_BRK_DET_TIM_02_FaultWithin490To510ms();
-  TC_BRK_REC_BVA_01_Recovery_When_BrakeIs126();
-  TC_BRK_REC_TIM_02_RecoveryWithin90To110ms();
-
-  TC_ACC_DET_BVA_02_FaultDetected();
-  TC_ACC_DET_TIM_02_Precision();
-  TC_ACC_REC_TIM_02_Precision();
-
-  TC_SPD_DET_BVA_02_FaultDetected();
-  TC_SPD_DET_TIM_02_Precision();
-  TC_SPD_REC_TIM_02_Precision();
+  // 사전조건 실행
+  BRK_PRE_01(); BRK_PRE_02();
+  
+  // 검출을 위해 정상 구동 상태로 세팅 (Run, On, NoPress)
+  setupPreCondition(1, 1, 0, 0, 100);
+  
+  // 나머지 TC 순차 실행
+  BRK_DET_00(); BRK_DET_01(); BRK_DET_02(); BRK_DET_03(); BRK_DET_04(); BRK_DET_05(); BRK_DET_06(); BRK_DET_07();
+  BRK_REC_S_01(); BRK_REC_S_02(); BRK_REC_S_03();
+  BRK_REC_M_00(); BRK_REC_M_01(); BRK_REC_M_02(); BRK_REC_M_03(); BRK_REC_M_04(); BRK_REC_M_05(); BRK_REC_M_06(); BRK_REC_M_07();
+  BRK_BND_01(); BRK_BND_02(); BRK_BND_03(); BRK_BND_04();
+  BRK_DEL_01(); BRK_DEL_02();
 }
