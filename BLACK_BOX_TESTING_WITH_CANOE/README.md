@@ -6,5 +6,6 @@
 ## 수동 테스트 UI
 <img width="869" height="517" alt="image" src="https://github.com/user-attachments/assets/f75fb154-4674-42be-9bec-664625a58481" />
 
+<img width="1675" height="629" alt="image" src="https://github.com/user-attachments/assets/602c492c-5341-4c91-891f-61aaf0e73e36" />
 
 ### 자동화 스크립트
