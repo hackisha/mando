@@ -3,8 +3,10 @@ includes { }
 
 variables
 {
-  message Fault_sts_Rsp Fault_sts_Rsp_msg;
-  message Fault_sts_Req Fault_sts_Req_msg;
+  message Fault_sts_Rsp Fault_sts_Rsp_msg; // ID: 0x556
+  message Fault_sts_Req Fault_sts_Req_msg; // ID: 0x555
+
+  const long kSYNC_TIMEOUT = 10; 
 }
 
 on message Fault_sts_Rsp
@@ -13,153 +15,224 @@ on message Fault_sts_Rsp
 }
 
 // -----------------------------------------------------------------
-// Helper Functions
+// [Helper Functions] 안정성 유지 및 시간 로직 제거 버전
 // -----------------------------------------------------------------
 
+// 1. 초기 환경 설정
 void setupPreCondition(long engineSts, long ignitionSts, long battPercent)
 {
   @sysvar::ENG::Sys_ENG_10ms_En = 1;
   @sysvar::ENG::Sys_IGN_2ms_En = 1;
   @sysvar::BMS::Sys_BMS_10ms_En = 1;
+  @sysvar::STR::Sys_STR_10ms_En = 0;
+  @sysvar::BRK::Sys_BRK_10ms_En = 0;
 
   @sysvar::ENG::Sys_Engine_sts = engineSts;
   @sysvar::ENG::Sys_Ignition_sts = ignitionSts;
-  @sysvar::BMS::Sys_Batt_Percent = battPercent; // Req 2: Needs 80% or more [cite: 460]
+  @sysvar::BMS::Sys_Batt_Percent = battPercent;
 
   Fault_sts_Req_msg.All_Fault_clr_request = 0;
   Fault_sts_Req_msg.All_Fault_sts_request = 0;
   output(Fault_sts_Req_msg);
 
-  testWaitForTimeout(100);
+  testWaitForTimeout(100); // 환경 전파 대기
 }
 
-void setChgCondition(long cond)
+// 2. 결함 초기화
+void initializeFaultState()
 {
-  @sysvar::BMS::Sys_Batt_Chg_Sts = cond; // Signal: Batt_Chg_Sts [cite: 86]
+  testStep("Init", "결함 초기화 시퀀스 시작");
+
+  @sysvar::BMS::Sys_Batt_Chg_Sts = 0; 
+  @sysvar::BMS::Sys_Batt_Percent = 85; 
+  testWaitForTimeout(100); // 정상 조건 인지 대기
+
+  Fault_sts_Req_msg.All_Fault_clr_request = 1;
+  output(Fault_sts_Req_msg);
+  testWaitForTimeout(100); 
+  
+  Fault_sts_Req_msg.All_Fault_clr_request = 0;
+  output(Fault_sts_Req_msg);
+  testWaitForTimeout(100); 
+
+  if(!requestAndVerifyLevel("Init_Verify", 0)) {
+    testStepFail("Init", "결함 초기화 실패.");
+  }
 }
 
-int requestFaultStatus(long timeoutMs)
+// 3. [싱크 주입] 요청 -> 응답(싱크) -> 직후 주입
+void syncAndInject(long eng, long ign, long batt, long cond)
 {
+  char logBuf[512];
+  
+  Fault_sts_Req_msg.All_Fault_sts_request = 1;
+  output(Fault_sts_Req_msg);
+  
+  if (testWaitForMessage(Fault_sts_Rsp, kSYNC_TIMEOUT)) {
+    testStep("Sync", "ECU Cycle 동기화 완료.");
+  }
+  
+  Fault_sts_Req_msg.All_Fault_sts_request = 0;
+  output(Fault_sts_Req_msg);
+
+  @sysvar::ENG::Sys_Engine_sts = eng;
+  @sysvar::ENG::Sys_Ignition_sts = ign;
+  @sysvar::BMS::Sys_Batt_Percent = batt;
+  @sysvar::BMS::Sys_Batt_Chg_Sts = cond; 
+
+  snprintf(logBuf, 512, "[주입] Engine:%ld, IGN:%ld, Batt:%ld%%, Cond:%ld", eng, ign, batt, cond);
+  testStep("Injection", logBuf);
+}
+
+// 4. [검증] 데이터 동기화 포함 (timeNow 제거)
+int requestAndVerifyLevel(char stepId[], long expectedLevel)
+{
+  char logBuf[512];
+  message Fault_sts_Rsp rxMsg; 
+
+  testWaitForTimeout(10); // 데이터 갱신 대기
+
   Fault_sts_Req_msg.All_Fault_sts_request = 1;
   output(Fault_sts_Req_msg);
 
-  if (testWaitForMessage(Fault_sts_Rsp, timeoutMs))
+  if (testWaitForMessage(Fault_sts_Rsp, kSYNC_TIMEOUT))
   {
+    testGetWaitEventMsgData(rxMsg); // 수신된 메시지 데이터 확보
+
     Fault_sts_Req_msg.All_Fault_sts_request = 0;
     output(Fault_sts_Req_msg);
-    return 1;
+
+    if (rxMsg.BATT_Chg_Err_sts == expectedLevel) {
+      snprintf(logBuf, 512, "[성공] 예상:%ld, 실제:%ld", expectedLevel, (long)rxMsg.BATT_Chg_Err_sts);
+      testStepPass(stepId, logBuf);
+      return 1;
+    } else {
+      snprintf(logBuf, 512, "[실패] 예상:%ld, 실제:%ld", expectedLevel, (long)rxMsg.BATT_Chg_Err_sts);
+      testStepFail(stepId, logBuf);
+      return 0;
+    }
   }
+  
   Fault_sts_Req_msg.All_Fault_sts_request = 0;
   output(Fault_sts_Req_msg);
+  testStepFail(stepId, "ECU 응답 타임아웃");
   return 0;
 }
 
-void clearAllFault()
-{
-  Fault_sts_Req_msg.All_Fault_sts_request = 0;
-  Fault_sts_Req_msg.All_Fault_clr_request = 1;
-  output(Fault_sts_Req_msg);
-  testWaitForTimeout(50);
-  Fault_sts_Req_msg.All_Fault_clr_request = 0;
-  output(Fault_sts_Req_msg);
-  testWaitForTimeout(50);
+testcase TC_PRE_01() {
+  testCaseTitle("TC_PRE_01", "Engine Off 시 검출 안됨");
+  initializeFaultState();
+  syncAndInject(0, 1, 85, 1);
+  testWaitForTimeout(5100);
+  requestAndVerifyLevel("Check", 0);
 }
 
-int verifyChgErrorStatus(char stepId[], long expected)
-{
-  testWaitForTimeout(20);
-
-  if (!requestFaultStatus(100))
-  {
-    testStepFail(stepId, "Fail. No response. Expected: %d, Actual: Timeout", expected);
-    return 0;
-  }
-
-  if (Fault_sts_Rsp_msg.BATT_Chg_Err_sts != expected) // Signal: BATT_Chg_Err_sts [cite: 277]
-  {
-    testStepFail(stepId, "Fail. Expected: %d, Actual: %d", expected, Fault_sts_Rsp_msg.BATT_Chg_Err_sts);
-    return 0;
-  }
-
-  testStepPass(stepId, "Pass. Expected: %d, Actual: %d", expected, Fault_sts_Rsp_msg.BATT_Chg_Err_sts);
-  return 1;
+testcase TC_PRE_02() {
+  testCaseTitle("TC_PRE_02", "IGN Off 시 검출 안됨");
+  initializeFaultState();
+  syncAndInject(1, 0, 85, 1);
+  testWaitForTimeout(5100);
+  requestAndVerifyLevel("Check", 0);
 }
 
-long measureTimeAfterChgChange(long cond, long targetStatus, long maxWaitMs)
-{
-  dword startTime;
-  dword currentTime;
-  long elapsed;
-
-  startTime = timeNow();
-  setChgCondition(cond);
-
-  while (1)
-  {
-    testWaitForTimeout(10);
-    currentTime = timeNow();
-    elapsed = (currentTime - startTime) / 100;
-
-    if (elapsed > maxWaitMs) break;
-
-    if (requestFaultStatus(50))
-    {
-      if (Fault_sts_Rsp_msg.BATT_Chg_Err_sts == targetStatus)
-      {
-        return (timeNow() - startTime) / 100;
-      }
-    }
-  }
-  return -1;
+testcase TC_PRE_03() {
+  testCaseTitle("TC_PRE_03", "배터리 조건 불만족(79%) 시 검출 안됨");
+  initializeFaultState();
+  syncAndInject(1, 1, 79, 1);
+  testWaitForTimeout(5100);
+  requestAndVerifyLevel("Check", 0);
 }
 
-// -----------------------------------------------------------------
-// Test Cases (Requirement 2: Battery Charging Error) [cite: 460]
-// -----------------------------------------------------------------
-
-testcase TC_1_Detection_Time_Check()
-{
-  long detectMs;
-  testStep("1.0", "Setup: Engine=Run, IGN=On, Batt=85%"); // Pre-condition Batt 80%+ [cite: 460]
-  setupPreCondition(1, 1, 85);
-  clearAllFault();
-
-  testStep("2.0", "Action: Set Chg Condition to 1 and measure time");
-  detectMs = measureTimeAfterChgChange(1, 2, 5200); 
-  
-  testStep("3.0", "Verify: Time 4900 ~ 5100 ms"); // Detection 5000ms +/- 100 [cite: 460]
-  if (detectMs < 4900 || detectMs > 5100)
-    testStepFail("3.1", "Fail. Time: %d ms. Expected: 4900 ~ 5100", detectMs);
-  else
-    testStepPass("3.1", "Pass. Time: %d ms. Expected: 4900 ~ 5100", detectMs);
-
-  verifyChgErrorStatus("3.2", 2);
+testcase TC_DET_COND_01() {
+  testCaseTitle("TC_DET_COND_01", "정상 상태(Cond 0) 시 검출 불가");
+  initializeFaultState();
+  syncAndInject(1, 1, 85, 0);
+  testWaitForTimeout(5100);
+  requestAndVerifyLevel("Check", 0);
 }
 
-testcase TC_2_Recovery_Time_Check()
-{
-  long recoverMs;
-  testStep("1.0", "Setup: Create Fault (Chg Cond 1)");
-  setupPreCondition(1, 1, 85);
-  setChgCondition(1);
-  testWaitForTimeout(5200);
-  if (!verifyChgErrorStatus("1.1", 2)) return;
-
-  testStep("2.0", "Action: Set Chg Condition to 0 and measure time");
-  recoverMs = measureTimeAfterChgChange(0, 1, 150); 
-
-  testStep("3.0", "Verify: Time 90 ~ 110 ms"); // Recovery 100ms +/- 10 [cite: 460]
-  if (recoverMs < 90 || recoverMs > 110)
-    testStepFail("3.1", "Fail. Time: %d ms. Expected: 90 ~ 110", recoverMs);
-  else
-    testStepPass("3.1", "Pass. Time: %d ms. Expected: 90 ~ 110", recoverMs);
-
-  verifyChgErrorStatus("3.2", 1);
+testcase TC_DET_COND_02() {
+  testCaseTitle("TC_DET_COND_02", "경계값(Batt 80%) 및 에러 시 검출 확인");
+  initializeFaultState();
+  syncAndInject(1, 1, 80, 1);
+  testWaitForTimeout(5100);
+  requestAndVerifyLevel("Check", 2);
 }
+
+testcase TC_DET_TIM_01() {
+  testCaseTitle("TC_DET_TIM_01", "검출 최소시간 미달(4900ms) 시 미검출");
+  initializeFaultState();
+  syncAndInject(1, 1, 85, 1);
+  testWaitForTimeout(4900);
+  requestAndVerifyLevel("Check", 0);
+}
+
+testcase TC_DET_TIM_02() {
+  testCaseTitle("TC_DET_TIM_02", "검출 허용시간 도달(5100ms) 시 검출 확인");
+  initializeFaultState();
+  syncAndInject(1, 1, 85, 1);
+  testWaitForTimeout(5100);
+  requestAndVerifyLevel("Check", 2);
+}
+
+testcase TC_REC_COND_01() {
+  testCaseTitle("TC_REC_COND_01", "에러 유지 시 회복 불가 확인");
+  initializeFaultState();
+  syncAndInject(1, 1, 85, 1);
+  testWaitForTimeout(5100);
+  if(!requestAndVerifyLevel("Fault_Check", 2)) return;
+
+  testWaitForTimeout(110);
+  requestAndVerifyLevel("Check", 2);
+}
+
+testcase TC_REC_COND_02() {
+  testCaseTitle("TC_REC_COND_02", "정상 도달(Cond 0) 시 Level 1로 회복");
+  initializeFaultState();
+  syncAndInject(1, 1, 85, 1);
+  testWaitForTimeout(5100);
+  requestAndVerifyLevel("Fault_Check", 2);
+
+  syncAndInject(1, 1, 85, 0); 
+  testWaitForTimeout(110);
+  requestAndVerifyLevel("Check", 1);
+}
+
+testcase TC_REC_TIM_01() {
+  testCaseTitle("TC_REC_TIM_01", "회복 최소시간 미달(90ms) 시 미회복");
+  initializeFaultState();
+  syncAndInject(1, 1, 85, 1);
+  testWaitForTimeout(5100);
+  requestAndVerifyLevel("Fault_Check", 2);
+
+  syncAndInject(1, 1, 85, 0);
+  testWaitForTimeout(90);
+  requestAndVerifyLevel("Check", 2);
+}
+
+testcase TC_REC_TIM_02() {
+  testCaseTitle("TC_REC_TIM_02", "회복 허용시간 도달(110ms) 시 회복 확인");
+  initializeFaultState();
+  syncAndInject(1, 1, 85, 1);
+  testWaitForTimeout(5100);
+  requestAndVerifyLevel("Fault_Check", 2);
+
+  syncAndInject(1, 1, 85, 0);
+  testWaitForTimeout(110);
+  requestAndVerifyLevel("Check", 1);
+}
+
+
 
 void mainTest()
 {
-  testModuleTitle("Req 2: Battery Charging Error Validation");
-  TC_1_Detection_Time_Check();
-  TC_2_Recovery_Time_Check();
+  testModuleTitle("Battery Charging Error Full Sync Baseline");
+  
+  setupPreCondition(1, 1, 85); 
+
+  TC_PRE_01(); TC_PRE_02(); TC_PRE_03();
+  TC_DET_COND_01(); TC_DET_COND_02();
+  TC_DET_TIM_01(); TC_DET_TIM_02();
+  TC_REC_COND_01(); TC_REC_COND_02();
+  TC_REC_TIM_01(); TC_REC_TIM_02();
 }
