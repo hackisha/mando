@@ -1,0 +1,21 @@
+/*@!Encoding:65001*/
+variables
+{
+  message BATT_01_10ms BMS_msg;
+  msTimer Timer_10ms;
+}
+
+on timer Timer_10ms
+{
+  output(BMS_msg);
+}
+
+on sysvar BMS::Sys_Batt_Chg_Sts { BMS_msg.Batt_Chg_Sts = @this; }
+on sysvar BMS::Sys_Batt_Percent { BMS_msg.Batt_Percent = @this; }
+on sysvar BMS::Sys_Batt_Voltage { BMS_msg.Batt_Voltage  = @this; }
+
+on sysvar BMS::Sys_BMS_10ms_En
+{
+  if (@this == 1) setTimerCyclic(Timer_10ms, 10);
+  else cancelTimer(Timer_10ms);
+}
