@@ -1,0 +1,20 @@
+/*@!Encoding:65001*/
+variables
+{
+  message Fault_sts_Req UDS_10ms_msg;
+  msTimer Timer_10ms;
+}
+
+on timer Timer_10ms
+{
+  output(UDS_10ms_msg);
+}
+
+on sysvar UDS::Sys_All_Fault_sts_request { UDS_10ms_msg.All_Fault_sts_request = @this; }
+on sysvar UDS::Sys_All_Fault_clr_request { UDS_10ms_msg.All_Fault_clr_request = @this; }
+
+on sysvar UDS::Sys_UDS_10ms_En
+{
+  if (@this == 1) setTimerCyclic(Timer_10ms, 10);
+  else cancelTimer(Timer_10ms);
+}
