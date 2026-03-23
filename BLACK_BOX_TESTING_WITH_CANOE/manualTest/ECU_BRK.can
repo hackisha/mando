@@ -1,0 +1,21 @@
+/*@!Encoding:65001*/
+variables
+{
+  message BRK_01_10ms BRK_msg;
+  msTimer Timer_10ms;
+}
+
+on timer Timer_10ms
+{
+  output(BRK_msg);
+}
+
+on sysvar BRK::Sys_ACCEL_press  { BRK_msg.ACCEL_press = @this; }
+on sysvar BRK::Sys_Brake_press  { BRK_msg.Brake_press = @this; }
+on sysvar BRK::Sys_Vehicle_Speed { BRK_msg.Vehicle_Speed = @this; }
+
+on sysvar BRK::Sys_BRK_10ms_En
+{
+  if (@this == 1) setTimerCyclic(Timer_10ms, 10);
+  else cancelTimer(Timer_10ms);
+}
