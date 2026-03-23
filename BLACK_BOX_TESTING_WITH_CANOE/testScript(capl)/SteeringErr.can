@@ -3,8 +3,10 @@ includes { }
 
 variables
 {
-  message Fault_sts_Rsp Fault_sts_Rsp_msg;
-  message Fault_sts_Req Fault_sts_Req_msg;
+  message Fault_sts_Rsp Fault_sts_Rsp_msg; // ID: 0x556
+  message Fault_sts_Req Fault_sts_Req_msg; // ID: 0x555
+
+  const long kSYNC_TIMEOUT = 10; 
 }
 
 on message Fault_sts_Rsp
@@ -12,17 +14,17 @@ on message Fault_sts_Rsp
   Fault_sts_Rsp_msg = this;
 }
 
-void setupPreCondition(long engineSts, long ignSts, long steeringAngle)
+
+// 1. 초기 환경 설정 (주기 메시지 En 포함)
+void setupPreCondition(long eng, long ign, long angle)
 {
   @sysvar::ENG::Sys_ENG_10ms_En = 1;
   @sysvar::ENG::Sys_IGN_2ms_En = 1;
-  @sysvar::STR::Sys_STR_10ms_En = 1;
-  @sysvar::BRK::Sys_BRK_10ms_En = 0;
-  @sysvar::BMS::Sys_BMS_10ms_En = 0;
-
-  @sysvar::ENG::Sys_Engine_sts = engineSts;
-  @sysvar::ENG::Sys_Ignition_sts = ignSts;
-  @sysvar::STR::Sys_Steering_angle = steeringAngle;
+  @sysvar::STR::Sys_STR_10ms_En = 1; // Steering 노드 활성화
+  
+  @sysvar::ENG::Sys_Engine_sts = eng;
+  @sysvar::ENG::Sys_Ignition_sts = ign;
+  @sysvar::STR::Sys_Steering_angle = angle;
 
   Fault_sts_Req_msg.All_Fault_clr_request = 0;
   Fault_sts_Req_msg.All_Fault_sts_request = 0;
@@ -31,345 +33,261 @@ void setupPreCondition(long engineSts, long ignSts, long steeringAngle)
   testWaitForTimeout(100);
 }
 
-void setSteeringAngle(long steeringAngle)
+// 2. 결함 초기화 (0점 조절 및 CLR 요청)
+void initializeFaultState()
 {
-  @sysvar::STR::Sys_Steering_angle = steeringAngle;
+  testStep("Init", "Steering Error 초기화 및 0점 확인");
+
+  @sysvar::STR::Sys_Steering_angle = 0;
+  testWaitForTimeout(50); 
+
+  Fault_sts_Req_msg.All_Fault_clr_request = 1;
+  output(Fault_sts_Req_msg);
+  testWaitForTimeout(100); 
+  
+  Fault_sts_Req_msg.All_Fault_clr_request = 0;
+  output(Fault_sts_Req_msg);
+  testWaitForTimeout(100); 
+
+  if(!requestAndVerifyLevel("Init_Verify", 0)) {
+    testStepFail("Init", "초기화 실패 (Fault Level 0 아님)");
+  }
 }
 
-int requestFaultStatus(long timeoutMs)
+// 3. [싱크 주입] Baseline 흐름: 요청 -> 응답 대기 -> 주입
+void syncAndInject(long eng, long ign, long angle)
 {
+  char logBuf[512];
+  
+  Fault_sts_Req_msg.All_Fault_sts_request = 1;
+  output(Fault_sts_Req_msg);
+  
+  if (testWaitForMessage(Fault_sts_Rsp, kSYNC_TIMEOUT)) {
+    testStep("Sync", "ECU Cycle 동기화 완료.");
+  }
+  
+  Fault_sts_Req_msg.All_Fault_sts_request = 0;
+  output(Fault_sts_Req_msg);
+
+  @sysvar::ENG::Sys_Engine_sts = eng;
+  @sysvar::ENG::Sys_Ignition_sts = ign;
+  @sysvar::STR::Sys_Steering_angle = angle; 
+
+  snprintf(logBuf, 512, "[주입] Eng:%ld, IGN:%ld, Angle:%ld", eng, ign, angle);
+  testStep("Injection", logBuf);
+}
+
+int requestAndVerifyLevel(char stepId[], long expectedLevel)
+{
+  char logBuf[512];
+  message Fault_sts_Rsp rxMsg; 
+
+  testWaitForTimeout(10); 
+
   Fault_sts_Req_msg.All_Fault_sts_request = 1;
   output(Fault_sts_Req_msg);
 
-  if (testWaitForMessage(Fault_sts_Rsp, timeoutMs))
+  if (testWaitForMessage(Fault_sts_Rsp, kSYNC_TIMEOUT))
   {
+    testGetWaitEventMsgData(rxMsg); 
+
     Fault_sts_Req_msg.All_Fault_sts_request = 0;
     output(Fault_sts_Req_msg);
-    return 1;
+
+    if (rxMsg.Steering_Err_sts == expectedLevel) {
+      snprintf(logBuf, 512, "[성공] 예상:%ld, 실제:%ld", expectedLevel, (long)rxMsg.Steering_Err_sts);
+      testStepPass(stepId, logBuf);
+      return 1;
+    } else {
+      snprintf(logBuf, 512, "[실패] 예상:%ld, 실제:%ld", expectedLevel, (long)rxMsg.Steering_Err_sts);
+      testStepFail(stepId, logBuf);
+      return 0;
+    }
   }
+  
   Fault_sts_Req_msg.All_Fault_sts_request = 0;
   output(Fault_sts_Req_msg);
+  testStepFail(stepId, "ECU 응답 타임아웃");
   return 0;
 }
 
-void clearAllFault()
+// 5. IGN Cycle 반복용 Helper
+void performIgnCycles(int count)
 {
-  Fault_sts_Req_msg.All_Fault_sts_request = 0;
-  Fault_sts_Req_msg.All_Fault_clr_request = 1;
-  output(Fault_sts_Req_msg);
-  testWaitForTimeout(50);
-  Fault_sts_Req_msg.All_Fault_clr_request = 0;
-  output(Fault_sts_Req_msg);
-  testWaitForTimeout(50);
-}
-
-int clearAndVerifyNoFault(char stepId[])
-{
-  clearAllFault();
-  if (!requestFaultStatus(100))
+  int i;
+  for(i = 1; i <= count; i++)
   {
-    testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout");
-    return 0;
+    @sysvar::ENG::Sys_Ignition_sts = 0; 
+    testWaitForTimeout(20);
+    @sysvar::ENG::Sys_Ignition_sts = 1; 
+    testWaitForTimeout(20);
   }
-  if (Fault_sts_Rsp_msg.Steering_Err_sts != 0)
-  {
-    testStepFail(stepId, "Fail. Expected: 0, Actual: %d", Fault_sts_Rsp_msg.Steering_Err_sts);
-    return 0;
-  }
-  testStepPass(stepId, "Pass. Expected: 0, Actual: 0");
-  return 1;
 }
 
-int verifyCurrentStatus(char stepId[], long expected)
+// -----------------------------------------------------------------
+// [Test Cases] 요구사항 테이블 (총 34개) 전체 구현
+// -----------------------------------------------------------------
+
+// --- 1. 검출 사전조건 (TC_DET_PRE) ---
+testcase TC_DET_PRE_01() { testCaseTitle("TC_DET_PRE_01", "Engine Stop(0) 시 미검출"); initializeFaultState(); syncAndInject(0, 1, 721); testWaitForTimeout(60); requestAndVerifyLevel("Check", 0); }
+testcase TC_DET_PRE_02() { testCaseTitle("TC_DET_PRE_02", "Engine Fault(2) 시 미검출"); initializeFaultState(); syncAndInject(2, 1, 721); testWaitForTimeout(60); requestAndVerifyLevel("Check", 0); }
+testcase TC_DET_PRE_03() { testCaseTitle("TC_DET_PRE_03", "IGN Off(0) 시 미검출"); initializeFaultState(); syncAndInject(1, 0, 721); testWaitForTimeout(60); requestAndVerifyLevel("Check", 0); }
+testcase TC_DET_PRE_04() { testCaseTitle("TC_DET_PRE_04", "Engine/IGN 둘 다 미충족 시 미검출"); initializeFaultState(); syncAndInject(0, 0, 721); testWaitForTimeout(60); requestAndVerifyLevel("Check", 0); }
+
+// --- 2. 검출 조건/경계값 (TC_DET_COND/BVA) ---
+testcase TC_DET_COND_01() { testCaseTitle("TC_DET_COND_01", "정상 중앙값(0) 미검출"); initializeFaultState(); syncAndInject(1, 1, 0); testWaitForTimeout(60); requestAndVerifyLevel("Check", 0); }
+testcase TC_DET_BVA_01() { testCaseTitle("TC_DET_BVA_01", "상한 경계(720) 미검출"); initializeFaultState(); syncAndInject(1, 1, 720); testWaitForTimeout(60); requestAndVerifyLevel("Check", 0); }
+testcase TC_DET_BVA_02() { testCaseTitle("TC_DET_BVA_02", "상한 초과(721) 검출"); initializeFaultState(); syncAndInject(1, 1, 721); testWaitForTimeout(60); requestAndVerifyLevel("Check", 2); }
+testcase TC_DET_BVA_03() { testCaseTitle("TC_DET_BVA_03", "하한 경계(-720) 미검출"); initializeFaultState(); syncAndInject(1, 1, -720); testWaitForTimeout(60); requestAndVerifyLevel("Check", 0); }
+testcase TC_DET_BVA_04() { testCaseTitle("TC_DET_BVA_04", "하한 미만(-721) 검출"); initializeFaultState(); syncAndInject(1, 1, -721); testWaitForTimeout(60); requestAndVerifyLevel("Check", 2); }
+
+// --- 3. 검출 시간 (TC_DET_TIM) ---
+testcase TC_DET_TIM_P_01() { testCaseTitle("TC_DET_TIM_P_01", "양방향 최소시간 미달(39ms)"); initializeFaultState(); syncAndInject(1, 1, 721); testWaitForTimeout(39); requestAndVerifyLevel("Check", 0); }
+testcase TC_DET_TIM_P_02() { testCaseTitle("TC_DET_TIM_P_02", "양방향 허용시간 도달(60ms)"); initializeFaultState(); syncAndInject(1, 1, 721); testWaitForTimeout(60); requestAndVerifyLevel("Check", 2); }
+testcase TC_DET_TIM_N_01() { testCaseTitle("TC_DET_TIM_N_01", "음방향 최소시간 미달(39ms)"); initializeFaultState(); syncAndInject(1, 1, -721); testWaitForTimeout(39); requestAndVerifyLevel("Check", 0); }
+testcase TC_DET_TIM_N_02() { testCaseTitle("TC_DET_TIM_N_02", "음방향 허용시간 도달(60ms)"); initializeFaultState(); syncAndInject(1, 1, -721); testWaitForTimeout(60); requestAndVerifyLevel("Check", 2); }
+
+testcase TC_DET_LONG_WAIT_01() {
+  testCaseTitle("TC_DET_LONG_WAIT_01", "양의 고장 주입 후 2초 대기 (지연 확인)");
+  initializeFaultState();
+  syncAndInject(1, 1, 750); // 사양보다 큰 값 주입
+  testWaitForTimeout(2000); // 2초간 충분히 대기
+  requestAndVerifyLevel("FinalCheck", 2);
+}
+
+testcase TC_REC_LONG_WAIT_01() {
+  testCaseTitle("TC_REC_LONG_WAIT_01", "회복 주입 후 2초 대기 (지연 확인)");
+  initializeFaultState();
+  syncAndInject(1, 1, 750);
+  testWaitForTimeout(100);
+  requestAndVerifyLevel("PreCheck", 2);
+
+  syncAndInject(1, 1, 0); // 정상 복귀
+  testWaitForTimeout(2000); // 2초간 충분히 대기
+  requestAndVerifyLevel("FinalCheck", 1);
+}
+
+// --- 4. 회복 가드/조건 (TC_REC_GUARD/COND) ---
+testcase TC_REC_GUARD_01() { testCaseTitle("TC_REC_GUARD_01", "사전 고장 없이 회복 불가 확인"); initializeFaultState(); syncAndInject(1, 1, 0); testWaitForTimeout(120); requestAndVerifyLevel("Check", 0); }
+
+testcase TC_REC_COND_P_01() { testCaseTitle("TC_REC_COND_P_01", "양의 고장 유지 시 회복 불가"); initializeFaultState(); syncAndInject(1, 1, 721); testWaitForTimeout(60); if(!requestAndVerifyLevel("Pre", 2)) return; syncAndInject(1, 1, 721); testWaitForTimeout(120); requestAndVerifyLevel("Check", 2); }
+testcase TC_REC_COND_P_02() { testCaseTitle("TC_REC_COND_P_02", "양의 고장에서 음의 고장 전이 시 유지"); initializeFaultState(); syncAndInject(1, 1, 721); testWaitForTimeout(60); requestAndVerifyLevel("Pre", 2); syncAndInject(1, 1, -721); testWaitForTimeout(120); requestAndVerifyLevel("Check", 2); }
+testcase TC_REC_COND_P_03() { testCaseTitle("TC_REC_COND_P_03", "양의 고장 720 도달 시 회복"); initializeFaultState(); syncAndInject(1, 1, 721); testWaitForTimeout(60); requestAndVerifyLevel("Pre", 2); syncAndInject(1, 1, 720); testWaitForTimeout(110); requestAndVerifyLevel("Check", 1); }
+testcase TC_REC_COND_P_04() { testCaseTitle("TC_REC_COND_P_04", "양의 고장 0 도달 시 회복"); initializeFaultState(); syncAndInject(1, 1, 721); testWaitForTimeout(60); requestAndVerifyLevel("Pre", 2); syncAndInject(1, 1, 0); testWaitForTimeout(110); requestAndVerifyLevel("Check", 1); }
+
+testcase TC_REC_COND_N_01() { testCaseTitle("TC_REC_COND_N_01", "음의 고장 유지 시 회복 불가"); initializeFaultState(); syncAndInject(1, 1, -721); testWaitForTimeout(60); requestAndVerifyLevel("Pre", 2); syncAndInject(1, 1, -721); testWaitForTimeout(120); requestAndVerifyLevel("Check", 2); }
+testcase TC_REC_COND_N_02() { testCaseTitle("TC_REC_COND_N_02", "음의 고장에서 양의 고장 전이 시 유지"); initializeFaultState(); syncAndInject(1, 1, -721); testWaitForTimeout(60); requestAndVerifyLevel("Pre", 2); syncAndInject(1, 1, 721); testWaitForTimeout(120); requestAndVerifyLevel("Check", 2); }
+testcase TC_REC_COND_N_03() { testCaseTitle("TC_REC_COND_N_03", "음의 고장 -720 도달 시 회복"); initializeFaultState(); syncAndInject(1, 1, -721); testWaitForTimeout(60); requestAndVerifyLevel("Pre", 2); syncAndInject(1, 1, -720); testWaitForTimeout(110); requestAndVerifyLevel("Check", 1); }
+testcase TC_REC_COND_N_04() { testCaseTitle("TC_REC_COND_N_04", "음의 고장 0 도달 시 회복"); initializeFaultState(); syncAndInject(1, 1, -721); testWaitForTimeout(60); requestAndVerifyLevel("Pre", 2); syncAndInject(1, 1, 0); testWaitForTimeout(110); requestAndVerifyLevel("Check", 1); }
+
+// --- 5. 회복 시간 (TC_REC_TIM) ---
+testcase TC_REC_TIM_P_01() { testCaseTitle("TC_REC_TIM_P_01", "양방향 회복 최소 미달(89ms)"); initializeFaultState(); syncAndInject(1, 1, 721); testWaitForTimeout(60); requestAndVerifyLevel("Pre", 2); syncAndInject(1, 1, 0); testWaitForTimeout(89); requestAndVerifyLevel("Check", 2); }
+testcase TC_REC_TIM_P_02() { testCaseTitle("TC_REC_TIM_P_02", "양방향 회복 허용 도달(110ms)"); initializeFaultState(); syncAndInject(1, 1, 721); testWaitForTimeout(60); requestAndVerifyLevel("Pre", 2); syncAndInject(1, 1, 0); testWaitForTimeout(110); requestAndVerifyLevel("Check", 1); }
+testcase TC_REC_TIM_N_01() { testCaseTitle("TC_REC_TIM_N_01", "음방향 회복 최소 미달(89ms)"); initializeFaultState(); syncAndInject(1, 1, -721); testWaitForTimeout(60); requestAndVerifyLevel("Pre", 2); syncAndInject(1, 1, 0); testWaitForTimeout(89); requestAndVerifyLevel("Check", 2); }
+testcase TC_REC_TIM_N_02() { testCaseTitle("TC_REC_TIM_N_02", "음방향 회복 허용 도달(110ms)"); initializeFaultState(); syncAndInject(1, 1, -721); testWaitForTimeout(60); requestAndVerifyLevel("Pre", 2); syncAndInject(1, 1, 0); testWaitForTimeout(110); requestAndVerifyLevel("Check", 1); }
+
+// --- 6. 재검출 (TC_REDET) ---
+testcase TC_REDET_01() { testCaseTitle("TC_REDET_01", "회복 후 같은 방향 재검출"); initializeFaultState(); syncAndInject(1, 1, 721); testWaitForTimeout(60); requestAndVerifyLevel("F", 2); syncAndInject(1, 1, 0); testWaitForTimeout(110); requestAndVerifyLevel("R", 1); syncAndInject(1, 1, 721); testWaitForTimeout(60); requestAndVerifyLevel("Check", 2); }
+testcase TC_REDET_02() { testCaseTitle("TC_REDET_02", "회복 후 반대 방향 재검출"); initializeFaultState(); syncAndInject(1, 1, 721); testWaitForTimeout(60); requestAndVerifyLevel("F", 2); syncAndInject(1, 1, 0); testWaitForTimeout(110); requestAndVerifyLevel("R", 1); syncAndInject(1, 1, -721); testWaitForTimeout(60); requestAndVerifyLevel("Check", 2); }
+testcase TC_REDET_03() { testCaseTitle("TC_REDET_03", "음의 회복 후 같은 방향 재검출"); initializeFaultState(); syncAndInject(1, 1, -721); testWaitForTimeout(60); requestAndVerifyLevel("F", 2); syncAndInject(1, 1, 0); testWaitForTimeout(110); requestAndVerifyLevel("R", 1); syncAndInject(1, 1, -721); testWaitForTimeout(60); requestAndVerifyLevel("Check", 2); }
+testcase TC_REDET_04() { testCaseTitle("TC_REDET_04", "음의 회복 후 반대 방향 재검출"); initializeFaultState(); syncAndInject(1, 1, -721); testWaitForTimeout(60); requestAndVerifyLevel("F", 2); syncAndInject(1, 1, 0); testWaitForTimeout(110); requestAndVerifyLevel("R", 1); syncAndInject(1, 1, 721); testWaitForTimeout(60); requestAndVerifyLevel("Check", 2); }
+
+// --- 7. 삭제 (TC_DEL) ---
+testcase TC_DEL_01() { testCaseTitle("TC_DEL_01", "양방향 회복 후 49 Cycle 유지"); initializeFaultState(); syncAndInject(1, 1, 721); testWaitForTimeout(60); syncAndInject(1, 1, 0); testWaitForTimeout(110); requestAndVerifyLevel("Store", 1); performIgnCycles(49); requestAndVerifyLevel("Check", 1); }
+testcase TC_DEL_02() { testCaseTitle("TC_DEL_02", "양방향 회복 후 50 Cycle 삭제"); initializeFaultState(); syncAndInject(1, 1, 721); testWaitForTimeout(60); syncAndInject(1, 1, 0); testWaitForTimeout(110); requestAndVerifyLevel("Store", 1); performIgnCycles(50); requestAndVerifyLevel("Check", 0); }
+testcase TC_DEL_03() { testCaseTitle("TC_DEL_03", "음방향 회복 후 49 Cycle 유지"); initializeFaultState(); syncAndInject(1, 1, -721); testWaitForTimeout(60); syncAndInject(1, 1, 0); testWaitForTimeout(110); requestAndVerifyLevel("Store", 1); performIgnCycles(49); requestAndVerifyLevel("Check", 1); }
+testcase TC_DEL_04() { testCaseTitle("TC_DEL_04", "음방향 회복 후 50 Cycle 삭제"); initializeFaultState(); syncAndInject(1, 1, -721); testWaitForTimeout(60); syncAndInject(1, 1, 0); testWaitForTimeout(110); requestAndVerifyLevel("Store", 1); performIgnCycles(50); requestAndVerifyLevel("Check", 0); }
+
+// 1. Engine Off 상태에서 고장 주입 (Long Wait 포함)
+testcase TC_DET_PRE_FAULT_01() 
 {
-  testWaitForTimeout(20);
-  if (!requestFaultStatus(100))
-  {
-    testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout");
-    return 0;
-  }
-  if (Fault_sts_Rsp_msg.Steering_Err_sts != expected)
-  {
-    testStepFail(stepId, "Fail. Expected: %d, Actual: %d", expected, Fault_sts_Rsp_msg.Steering_Err_sts);
-    return 0;
-  }
-  testStepPass(stepId, "Pass. Expected: %d, Actual: %d", expected, Fault_sts_Rsp_msg.Steering_Err_sts);
-  return 1;
+  testCaseTitle("TC_DET_PRE_FAULT_01", "사전조건 위반: Engine Off 시 고장 주입 확인");
+  initializeFaultState();
+
+  // Engine: Stop(0), IGN: On(1), Angle: 750 (고장값)
+  syncAndInject(0, 1, 750); 
+  
+  // 지연 시간(50ms)보다 훨씬 긴 시간을 기다려도 0을 유지하는지 확인
+  testWaitForTimeout(1000); 
+  requestAndVerifyLevel("FinalCheck", 0);
 }
 
-long measureTimeAfterChange(long angle, long targetStatus, long maxWaitMs, long pollMs)
+// 2. IGN Off 상태에서 고장 주입 (Long Wait 포함)
+testcase TC_DET_PRE_FAULT_02() 
 {
-  dword startTime;
-  dword currentTime;
-  long elapsed;
+  testCaseTitle("TC_DET_PRE_FAULT_02", "사전조건 위반: IGN Off 시 고장 주입 확인");
+  initializeFaultState();
 
-  startTime = timeNow();
-  setSteeringAngle(angle);
-
-  while (1)
-  {
-    testWaitForTimeout(pollMs);
-    currentTime = timeNow();
-    elapsed = (currentTime - startTime) / 100;
-    if (elapsed > maxWaitMs) break;
-
-    if (requestFaultStatus(50))
-    {
-      if (Fault_sts_Rsp_msg.Steering_Err_sts == targetStatus)
-      {
-        return (timeNow() - startTime) / 100;
-      }
-    }
-  }
-  return -1;
+  // Engine: Run(1), IGN: Off(0), Angle: 750 (고장값)
+  syncAndInject(1, 0, 750); 
+  
+  testWaitForTimeout(1000); 
+  requestAndVerifyLevel("FinalCheck", 0);
 }
 
-int checkTimeLimit(char stepId[], long measuredMs, long minMs, long maxMs)
+// 3. 복합 사전조건 위반 (Engine Off & IGN Off)
+testcase TC_DET_PRE_FAULT_03() 
 {
-  if (measuredMs < 0)
-  {
-    testStepFail(stepId, "Fail. Expected: Change within %d ms, Actual: Timeout", maxMs);
-    return 0;
-  }
-  if (measuredMs < minMs || measuredMs > maxMs)
-  {
-    testStepFail(stepId, "Fail. Expected: %d ~ %d ms, Actual: %d ms", minMs, maxMs, measuredMs);
-    return 0;
-  }
-  testStepPass(stepId, "Pass. Expected: %d ~ %d ms, Actual: %d ms", minMs, maxMs, measuredMs);
-  return 1;
+  testCaseTitle("TC_DET_PRE_FAULT_03", "사전조건 복합 위반: Engine/IGN Off 시 고장 주입");
+  initializeFaultState();
+
+  // Engine: Stop(0), IGN: Off(0), Angle: 750 (고장값)
+  syncAndInject(0, 0, 750); 
+  
+  testWaitForTimeout(1000); 
+  requestAndVerifyLevel("FinalCheck", 0);
 }
 
-int checkStatusNotChangedAtTime(char stepId[], long waitMs, long unexpectedStatus)
+// 4. Engine Fault 상태에서 고장 주입
+testcase TC_DET_PRE_FAULT_04() 
 {
-  testWaitForTimeout(20);
-  testWaitForTimeout(waitMs);
-  if (!requestFaultStatus(100))
-  {
-    testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout");
-    return 0;
-  }
-  if (Fault_sts_Rsp_msg.Steering_Err_sts == unexpectedStatus)
-  {
-    testStepFail(stepId, "Fail. Expected: NOT %d yet, Actual: %d at %d ms", unexpectedStatus, unexpectedStatus, waitMs);
-    return 0;
-  }
-  testStepPass(stepId, "Pass. Expected: NOT %d yet, Actual: %d at %d ms", unexpectedStatus, Fault_sts_Rsp_msg.Steering_Err_sts, waitMs);
-  return 1;
+  testCaseTitle("TC_DET_PRE_FAULT_04", "사전조건 위반: Engine Fault(2) 시 고장 주입");
+  initializeFaultState();
+
+  // Engine: Fault(2), IGN: On(1), Angle: 750 (고장값)
+  syncAndInject(2, 1, 750); 
+  
+  testWaitForTimeout(1000); 
+  requestAndVerifyLevel("FinalCheck", 0);
 }
 
-int checkNoFaultForDuration(char stepId[], long totalWaitMs, long pollMs)
-{
-  dword startTime;
-  dword currentTime;
-  long elapsed;
-
-  testWaitForTimeout(20);
-  startTime = timeNow();
-
-  while (1)
-  {
-    currentTime = timeNow();
-    elapsed = (currentTime - startTime) / 100;
-    if (elapsed > totalWaitMs) break;
-
-    if (!requestFaultStatus(100))
-    {
-      testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout at %d ms", elapsed);
-      return 0;
-    }
-    if (Fault_sts_Rsp_msg.Steering_Err_sts == 2)
-    {
-      testStepFail(stepId, "Fail. Expected: 0, Actual: 2 (Fault detected early at %d ms)", elapsed);
-      return 0;
-    }
-    testWaitForTimeout(pollMs);
-  }
-  testStepPass(stepId, "Pass. Expected: 0 for %d ms, Actual: 0", totalWaitMs);
-  return 1;
-}
-
-int setupAndClearFault(char clearStepId[], long engineSts, long ignSts, long steeringAngle)
-{
-  setupPreCondition(engineSts, ignSts, steeringAngle);
-  if (!clearAndVerifyNoFault(clearStepId)) return 0;
-  return 1;
-}
-
-testcase TC_PRE_01_NoDetection_When_EngineIsOff()
-{
-  testStep("1.0", "Setup: Engine=0, IGN=1, STR=0");
-  if (!setupAndClearFault("1.1", 0, 1, 0)) return;
-  testStep("2.0", "Check: Set STR=721 and wait 70 ms");
-  setSteeringAngle(721);
-  checkNoFaultForDuration("2.1", 70, 20);
-}
-
-testcase TC_PRE_02_NoDetection_When_IgnitionIsOff()
-{
-  testStep("1.0", "Setup: Engine=1, IGN=0, STR=0");
-  if (!setupAndClearFault("1.1", 1, 0, 0)) return;
-  testStep("2.0", "Check: Set STR=721 and wait 70 ms");
-  setSteeringAngle(721);
-  checkNoFaultForDuration("2.1", 70, 20);
-}
-
-testcase TC_DET_BVA_01_NoFault_When_StrIs720()
-{
-  testStep("1.0", "Setup: Engine=1, IGN=1, STR=0");
-  if (!setupAndClearFault("1.1", 1, 1, 0)) return;
-  testStep("2.0", "Check: Set STR=720 and wait 70 ms");
-  setSteeringAngle(720);
-  checkNoFaultForDuration("2.1", 70, 20);
-}
-
-testcase TC_DET_BVA_02_NoFault_When_StrIsMinus720()
-{
-  testStep("1.0", "Setup: Engine=1, IGN=1, STR=0");
-  if (!setupAndClearFault("1.1", 1, 1, 0)) return;
-  testStep("2.0", "Check: Set STR=-720 and wait 70 ms");
-  setSteeringAngle(-720);
-  checkNoFaultForDuration("2.1", 70, 20);
-}
-
-testcase TC_DET_BVA_03_FaultDetected_When_StrIs721()
-{
-  testStep("1.0", "Setup: Engine=1, IGN=1, STR=0");
-  if (!setupAndClearFault("1.1", 1, 1, 0)) return;
-  testStep("2.0", "Action: Set STR=721 and wait 70 ms");
-  setSteeringAngle(721);
-  testWaitForTimeout(70);
-  verifyCurrentStatus("3.0", 2);
-}
-
-testcase TC_DET_BVA_04_FaultDetected_When_StrIsMinus721()
-{
-  testStep("1.0", "Setup: Engine=1, IGN=1, STR=0");
-  if (!setupAndClearFault("1.1", 1, 1, 0)) return;
-  testStep("2.0", "Action: Set STR=-721 and wait 70 ms");
-  setSteeringAngle(-721);
-  testWaitForTimeout(70);
-  verifyCurrentStatus("3.0", 2);
-}
-
-testcase TC_DET_TIM_01_NoFaultBefore39ms()
-{
-  testStep("1.0", "Setup: Engine=1, IGN=1, STR=0");
-  if (!setupAndClearFault("1.1", 1, 1, 0)) return;
-  testStep("2.0", "Check: Wait 39 ms");
-  setSteeringAngle(721);
-  checkStatusNotChangedAtTime("2.1", 39, 2);
-}
-
-testcase TC_DET_TIM_02_FaultWithin40To60ms()
-{
-  long detectMs;
-  testStep("1.0", "Setup: Engine=1, IGN=1, STR=0");
-  if (!setupAndClearFault("1.1", 1, 1, 0)) return;
-  testStep("2.0", "Measure: Time to Level 2");
-  detectMs = measureTimeAfterChange(721, 2, 80, 5);
-  checkTimeLimit("3.0", detectMs, 40, 60);
-  verifyCurrentStatus("3.1", 2);
-}
-
-testcase TC_REC_BVA_01_NoRecovery_When_StrIs721()
-{
-  testStep("1.0", "Action: Create Fault Level 2");
-  if (!setupAndClearFault("1.1", 1, 1, 0)) return;
-  setSteeringAngle(721);
-  testWaitForTimeout(70);
-  if (!verifyCurrentStatus("1.2", 2)) return;
-  testStep("2.0", "Check: Keep STR=721 and wait 120 ms");
-  setSteeringAngle(721);
-  testWaitForTimeout(120);
-  verifyCurrentStatus("2.1", 2);
-}
-
-testcase TC_REC_BVA_02_Recovery_When_StrIs720()
-{
-  testStep("1.0", "Action: Create Fault Level 2");
-  if (!setupAndClearFault("1.1", 1, 1, 0)) return;
-  setSteeringAngle(721);
-  testWaitForTimeout(70);
-  if (!verifyCurrentStatus("1.2", 2)) return;
-  testStep("2.0", "Action: Set STR=720 and wait 120 ms");
-  setSteeringAngle(720);
-  testWaitForTimeout(120);
-  verifyCurrentStatus("2.1", 1);
-}
-
-testcase TC_REC_BVA_03_NoRecovery_When_StrIsMinus721()
-{
-  testStep("1.0", "Action: Create Fault Level 2");
-  if (!setupAndClearFault("1.1", 1, 1, 0)) return;
-  setSteeringAngle(-721);
-  testWaitForTimeout(70);
-  if (!verifyCurrentStatus("1.2", 2)) return;
-  testStep("2.0", "Check: Keep STR=-721 and wait 120 ms");
-  setSteeringAngle(-721);
-  testWaitForTimeout(120);
-  verifyCurrentStatus("2.1", 2);
-}
-
-testcase TC_REC_BVA_04_Recovery_When_StrIsMinus720()
-{
-  testStep("1.0", "Action: Create Fault Level 2");
-  if (!setupAndClearFault("1.1", 1, 1, 0)) return;
-  setSteeringAngle(-721);
-  testWaitForTimeout(70);
-  if (!verifyCurrentStatus("1.2", 2)) return;
-  testStep("2.0", "Action: Set STR=-720 and wait 120 ms");
-  setSteeringAngle(-720);
-  testWaitForTimeout(120);
-  verifyCurrentStatus("2.1", 1);
-}
-
-testcase TC_REC_TIM_01_NoRecoveryBefore89ms()
-{
-  testStep("1.0", "Action: Create Fault Level 2");
-  if (!setupAndClearFault("1.1", 1, 1, 0)) return;
-  setSteeringAngle(721);
-  testWaitForTimeout(70);
-  if (!verifyCurrentStatus("1.2", 2)) return;
-  testStep("2.0", "Check: Wait 89 ms");
-  setSteeringAngle(0);
-  checkStatusNotChangedAtTime("2.1", 89, 1);
-}
-
-testcase TC_REC_TIM_02_RecoveryWithin90To110ms()
-{
-  long recoverMs;
-  testStep("1.0", "Action: Create Fault Level 2");
-  if (!setupAndClearFault("1.1", 1, 1, 0)) return;
-  setSteeringAngle(721);
-  testWaitForTimeout(70);
-  if (!verifyCurrentStatus("1.2", 2)) return;
-  testStep("2.0", "Measure: Time to Level 1");
-  recoverMs = measureTimeAfterChange(0, 1, 150, 10);
-  checkTimeLimit("3.0", recoverMs, 90, 110);
-  verifyCurrentStatus("3.1", 1);
-}
-
+// -----------------------------------------------------------------
+// [Main]
+// -----------------------------------------------------------------
 void mainTest()
 {
-  testModuleTitle("Req 7: Steering Error Validation");
+  testModuleTitle("Steering Error Chassis Group");
 
-  TC_PRE_01_NoDetection_When_EngineIsOff();
-  TC_PRE_02_NoDetection_When_IgnitionIsOff();
-
-  TC_DET_BVA_01_NoFault_When_StrIs720();
-  TC_DET_BVA_02_NoFault_When_StrIsMinus720();
-  TC_DET_BVA_03_FaultDetected_When_StrIs721();
-  TC_DET_BVA_04_FaultDetected_When_StrIsMinus721();
+  // 1~4. 사전조건 및 검출
+  TC_DET_PRE_01(); TC_DET_PRE_02(); TC_DET_PRE_03(); TC_DET_PRE_04();
+  TC_DET_COND_01(); TC_DET_BVA_01(); TC_DET_BVA_02(); TC_DET_BVA_03(); TC_DET_BVA_04();
   
-  TC_DET_TIM_01_NoFaultBefore39ms();
-  TC_DET_TIM_02_FaultWithin40To60ms();
-
-  TC_REC_BVA_01_NoRecovery_When_StrIs721();
-  TC_REC_BVA_02_Recovery_When_StrIs720();
-  TC_REC_BVA_03_NoRecovery_When_StrIsMinus721();
-  TC_REC_BVA_04_Recovery_When_StrIsMinus720();
-
-  TC_REC_TIM_01_NoRecoveryBefore89ms();
-  TC_REC_TIM_02_RecoveryWithin90To110ms();
+  
+  setupPreCondition(1,1,0);
+  
+  // 사전조건 미충족 + 고장 주입 테스트 섹션
+  TC_DET_PRE_FAULT_01();
+  TC_DET_PRE_FAULT_02();
+  TC_DET_PRE_FAULT_03();
+  TC_DET_PRE_FAULT_04();
+  
+  // 10~13. 검출 시간
+  TC_DET_TIM_P_01(); TC_DET_TIM_P_02(); TC_DET_TIM_N_01(); TC_DET_TIM_N_02();
+  
+  TC_DET_LONG_WAIT_01();
+  TC_REC_LONG_WAIT_01();
+  
+  // 14~22. 회복 가드 및 조건
+  TC_REC_GUARD_01();
+  TC_REC_COND_P_01(); TC_REC_COND_P_02(); TC_REC_COND_P_03(); TC_REC_COND_P_04();
+  TC_REC_COND_N_01(); TC_REC_COND_N_02(); TC_REC_COND_N_03(); TC_REC_COND_N_04();
+  
+  // 23~26. 회복 시간
+  TC_REC_TIM_P_01(); TC_REC_TIM_P_02(); TC_REC_TIM_N_01(); TC_REC_TIM_N_02();
+  
+  // 27~30. 재검출
+  TC_REDET_01(); TC_REDET_02(); TC_REDET_03(); TC_REDET_04();
+  
+  // 31~34. 삭제 시퀀스
+  TC_DEL_01(); TC_DEL_02(); TC_DEL_03(); TC_DEL_04();
 }
