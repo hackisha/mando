@@ -5,6 +5,8 @@ variables
 {
   message Fault_sts_Rsp Fault_sts_Rsp_msg; // ID: 0x556
   message Fault_sts_Req Fault_sts_Req_msg; // ID: 0x555
+
+  const long kSYNC_TIMEOUT = 10; 
 }
 
 on message Fault_sts_Rsp
@@ -12,18 +14,13 @@ on message Fault_sts_Rsp
   Fault_sts_Rsp_msg = this;
 }
 
-// -----------------------------------------------------------------
-// Helper Functions
-// -----------------------------------------------------------------
 
+// 1. 초기 환경 설정 및 주기 메시지 엔진 활성화
 void setupPreCondition(long engineSts, long ignitionSts, long battPercent)
 {
-  // Enable required nodes
   @sysvar::ENG::Sys_ENG_10ms_En = 1;
   @sysvar::ENG::Sys_IGN_2ms_En = 1;
   @sysvar::BMS::Sys_BMS_10ms_En = 1;
-  
-  // Disable other nodes
   @sysvar::STR::Sys_STR_10ms_En = 0;
   @sysvar::BRK::Sys_BRK_10ms_En = 0;
 
@@ -31,339 +28,224 @@ void setupPreCondition(long engineSts, long ignitionSts, long battPercent)
   @sysvar::ENG::Sys_Ignition_sts = ignitionSts;
   @sysvar::BMS::Sys_Batt_Percent = battPercent;
 
-  // Reset request
   Fault_sts_Req_msg.All_Fault_clr_request = 0;
   Fault_sts_Req_msg.All_Fault_sts_request = 0;
   output(Fault_sts_Req_msg);
 
-  testWaitForTimeout(100);
+  testWaitForTimeout(100); 
 }
 
-void setBattPercent(long battPercent)
+// 2. 결함 초기화 시퀀스
+void initializeFaultState()
 {
-  @sysvar::BMS::Sys_Batt_Percent = battPercent;
+  testStep("Init", "Battery Percent 초기화 시작");
+
+  @sysvar::BMS::Sys_Batt_Percent = 50; // 정상 범위(50%) 세팅
+  testWaitForTimeout(100); 
+
+  Fault_sts_Req_msg.All_Fault_clr_request = 1;
+  output(Fault_sts_Req_msg);
+  testWaitForTimeout(100); 
+  
+  Fault_sts_Req_msg.All_Fault_clr_request = 0;
+  output(Fault_sts_Req_msg);
+  testWaitForTimeout(100); 
+
+  if(!requestAndVerifyLevel("Init_Verify", 0)) {
+    testStepFail("Init", "초기화 실패. 현재 Fault Level이 0이 아닙니다.");
+  }
 }
 
-int requestFaultStatus(long timeoutMs)
+// 3. [싱크 주입] Baseline 흐름: 요청 -> 응답 대기 -> 주입
+void syncAndInject(long eng, long ign, long batt)
 {
+  char logBuf[512];
+  
+  Fault_sts_Req_msg.All_Fault_sts_request = 1;
+  output(Fault_sts_Req_msg);
+  
+  if (testWaitForMessage(Fault_sts_Rsp, kSYNC_TIMEOUT)) {
+    testStep("Sync", "ECU Cycle 동기화 완료.");
+  }
+  
+  Fault_sts_Req_msg.All_Fault_sts_request = 0;
+  output(Fault_sts_Req_msg);
+
+  @sysvar::ENG::Sys_Engine_sts = eng;
+  @sysvar::ENG::Sys_Ignition_sts = ign;
+  @sysvar::BMS::Sys_Batt_Percent = batt; 
+
+  snprintf(logBuf, 512, "[주입] Engine:%ld, IGN:%ld, Battery:%ld%%", eng, ign, batt);
+  testStep("Injection", logBuf);
+}
+
+// 4. [검증] Baseline 흐름: 10ms 대기 -> 요청 
+int requestAndVerifyLevel(char stepId[], long expectedLevel)
+{
+  char logBuf[512];
+  message Fault_sts_Rsp rxMsg; 
+
+  testWaitForTimeout(10); //wait time
+
   Fault_sts_Req_msg.All_Fault_sts_request = 1;
   output(Fault_sts_Req_msg);
 
-  if (testWaitForMessage(Fault_sts_Rsp, timeoutMs))
+  if (testWaitForMessage(Fault_sts_Rsp, kSYNC_TIMEOUT))
   {
-    // Clear request immediately for 10ms rule
+    testGetWaitEventMsgData(rxMsg); 
+
     Fault_sts_Req_msg.All_Fault_sts_request = 0;
     output(Fault_sts_Req_msg);
-    return 1;
-  }
 
+    if (rxMsg.BATT_Percent_Err_sts == expectedLevel) {
+      snprintf(logBuf, 512, "[성공] 예상:%ld, 실제:%ld", expectedLevel, (long)rxMsg.BATT_Percent_Err_sts);
+      testStepPass(stepId, logBuf);
+      return 1;
+    } else {
+      snprintf(logBuf, 512, "[실패] 예상:%ld, 실제:%ld", expectedLevel, (long)rxMsg.BATT_Percent_Err_sts);
+      testStepFail(stepId, logBuf);
+      return 0;
+    }
+  }
+  
   Fault_sts_Req_msg.All_Fault_sts_request = 0;
   output(Fault_sts_Req_msg);
+  testStepFail(stepId, "ECU 응답 타임아웃");
   return 0;
 }
 
-void clearAllFault()
-{
-  Fault_sts_Req_msg.All_Fault_sts_request = 0;
-  Fault_sts_Req_msg.All_Fault_clr_request = 1;
-  output(Fault_sts_Req_msg);
-  testWaitForTimeout(50);
-
-  Fault_sts_Req_msg.All_Fault_clr_request = 0;
-  output(Fault_sts_Req_msg);
-  testWaitForTimeout(50);
+// --- 1. 사전조건 (Precondition) ---
+testcase TC_PRE_01() {
+  testCaseTitle("PRE_01", "사전조건: Engine Off 시 검출 안됨");
+  setupPreCondition(0, 1, 50);
+  initializeFaultState();
+  syncAndInject(0, 1, 14); 
+  testWaitForTimeout(5100);
+  requestAndVerifyLevel("Check", 0); 
 }
 
-int clearAndVerifyNoFault(char stepId[])
-{
-  clearAllFault();
-
-  if (!requestFaultStatus(100))
-  {
-    testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout");
-    return 0;
-  }
-
-  if (Fault_sts_Rsp_msg.BATT_Percent_Err_sts != 0)
-  {
-    testStepFail(stepId, "Fail. Expected: 0, Actual: %d", Fault_sts_Rsp_msg.BATT_Percent_Err_sts);
-    return 0;
-  }
-
-  testStepPass(stepId, "Pass. Expected: 0, Actual: 0");
-  return 1;
+testcase TC_PRE_02() {
+  testCaseTitle("PRE_02", "사전조건: Ignition Off 시 검출 안됨");
+  setupPreCondition(1, 0, 50);
+  initializeFaultState();
+  syncAndInject(1, 0, 14);
+  testWaitForTimeout(5100);
+  requestAndVerifyLevel("Check", 0);
 }
 
-int verifyCurrentPercentStatus(char stepId[], long expected)
-{
-  testWaitForTimeout(20); // Gap for 10ms rule
-
-  if (!requestFaultStatus(100))
-  {
-    testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout");
-    return 0;
-  }
-
-  if (Fault_sts_Rsp_msg.BATT_Percent_Err_sts != expected)
-  {
-    testStepFail(stepId, "Fail. Expected: %d, Actual: %d", expected, Fault_sts_Rsp_msg.BATT_Percent_Err_sts);
-    return 0;
-  }
-
-  testStepPass(stepId, "Pass. Expected: %d, Actual: %d", expected, Fault_sts_Rsp_msg.BATT_Percent_Err_sts);
-  return 1;
+// --- 2. 검출 조건 (Detection Condition) ---
+testcase TC_DET_COND_01() {
+  testCaseTitle("DET_COND_01", "검출조건: 16% (정상 범위) 유지 확인");
+  initializeFaultState();
+  syncAndInject(1, 1, 16);
+  testWaitForTimeout(5100);
+  requestAndVerifyLevel("Check", 0);
 }
 
-long measureTimeAfterPercentChange(long battPercent, long targetStatus, long maxWaitMs, long pollMs)
-{
-  dword startTime;
-  dword currentTime;
-  long elapsed;
-
-  startTime = timeNow();
-  setBattPercent(battPercent);
-
-  while (1)
-  {
-    testWaitForTimeout(pollMs); // Gap for 10ms rule
-    
-    currentTime = timeNow();
-    elapsed = (currentTime - startTime) / 100;
-
-    if (elapsed > maxWaitMs) break;
-
-    if (requestFaultStatus(50))
-    {
-      if (Fault_sts_Rsp_msg.BATT_Percent_Err_sts == targetStatus)
-      {
-        currentTime = timeNow();
-        return (currentTime - startTime) / 100;
-      }
-    }
-  }
-  return -1;
+testcase TC_DET_COND_02() {
+  testCaseTitle("DET_COND_02", "검출조건: 14% (결함 범위) 검출 확인");
+  initializeFaultState();
+  syncAndInject(1, 1, 14);
+  testWaitForTimeout(5100);
+  requestAndVerifyLevel("Check", 2);
 }
 
-int checkTimeLimit(char stepId[], long measuredMs, long minMs, long maxMs)
+testcase TC_DET_BVA_15_Fault()
 {
-  if (measuredMs < 0)
-  {
-    testStepFail(stepId, "Fail. Expected: Change within %d ms, Actual: Timeout", maxMs);
-    return 0;
-  }
-
-  if (measuredMs < minMs || measuredMs > maxMs)
-  {
-    testStepFail(stepId, "Fail. Expected: %d ~ %d ms, Actual: %d ms", minMs, maxMs, measuredMs);
-    return 0;
-  }
-
-  testStepPass(stepId, "Pass. Expected: %d ~ %d ms, Actual: %d ms", minMs, maxMs, measuredMs);
-  return 1;
+  testCaseTitle("DET_BVA_15", "결함 경계값 검출 확인 (15%)");
+  initializeFaultState();
+  syncAndInject(1, 1, 15); // 딱 경계값 주입
+  testWaitForTimeout(5100); 
+  requestAndVerifyLevel("Check", 2); // 결함(2) 발생해야 함
 }
 
-int checkStatusNotChangedAtTime(char stepId[], long waitMs, long unexpectedStatus)
-{
-  testWaitForTimeout(20); // Gap for 10ms rule
-  testWaitForTimeout(waitMs);
-
-  if (!requestFaultStatus(100))
-  {
-    testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout");
-    return 0;
-  }
-
-  if (Fault_sts_Rsp_msg.BATT_Percent_Err_sts == unexpectedStatus)
-  {
-    testStepFail(stepId, "Fail. Expected: NOT %d yet, Actual: %d at %d ms", unexpectedStatus, unexpectedStatus, waitMs);
-    return 0;
-  }
-
-  testStepPass(stepId, "Pass. Expected: NOT %d yet, Actual: %d at %d ms", unexpectedStatus, Fault_sts_Rsp_msg.BATT_Percent_Err_sts, waitMs);
-  return 1;
+// --- 3. 검출 시간 경계값 (4890ms ~ 5110ms) ---
+testcase TC_DET_TIM_01_LowerLimit() {
+  testCaseTitle("DET_TIM_01", "검출시간: 4890ms 시점 미검출 확인 (하한 경계)");
+  initializeFaultState();
+  syncAndInject(1, 1, 14);
+  testWaitForTimeout(4890);
+  requestAndVerifyLevel("Check", 0);
 }
 
-int checkNoFaultForDuration(char stepId[], long totalWaitMs, long pollMs)
-{
-  dword startTime;
-  dword currentTime;
-  long elapsed;
-
-  testWaitForTimeout(20); // Gap for 10ms rule
-  startTime = timeNow();
-
-  while (1)
-  {
-    currentTime = timeNow();
-    elapsed = (currentTime - startTime) / 100;
-
-    if (elapsed > totalWaitMs) break;
-
-    if (!requestFaultStatus(100))
-    {
-      testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout at %d ms", elapsed);
-      return 0;
-    }
-
-    if (Fault_sts_Rsp_msg.BATT_Percent_Err_sts == 2)
-    {
-      testStepFail(stepId, "Fail. Expected: 0, Actual: 2 (Fault detected early at %d ms)", elapsed);
-      return 0;
-    }
-
-    testWaitForTimeout(pollMs);
-  }
-
-  testStepPass(stepId, "Pass. Expected: 0 for %d ms, Actual: 0", totalWaitMs);
-  return 1;
+testcase TC_DET_TIM_02_UpperLimit() {
+  testCaseTitle("DET_TIM_02", "검출시간: 5110ms 시점 확정 확인 (상한 경계)");
+  initializeFaultState();
+  syncAndInject(1, 1, 14);
+  testWaitForTimeout(5110);
+  requestAndVerifyLevel("Check", 2);
 }
 
-int setupAndClearFault(char clearStepId[], long engineSts, long ignitionSts, long battPercent)
-{
-  setupPreCondition(engineSts, ignitionSts, battPercent);
+// --- 4. 회복 조건 (Recovery Condition) ---
+testcase TC_REC_COND_01() {
+  testCaseTitle("REC_COND_01", "회복조건: 29%에서 회복 안됨 확인");
+  initializeFaultState();
+  syncAndInject(1, 1, 10);
+  testWaitForTimeout(5100);
+  if(!requestAndVerifyLevel("Fault_Check", 2)) return;
 
-  if (!clearAndVerifyNoFault(clearStepId)) return 0;
-  return 1;
+  syncAndInject(1, 1, 29);
+  testWaitForTimeout(100);
+  requestAndVerifyLevel("Recovery_Check", 2);
 }
 
-// -----------------------------------------------------------------
-// Test Cases
-// -----------------------------------------------------------------
+testcase TC_REC_COND_02() {
+  testCaseTitle("REC_COND_02", "회복조건: 30%에서 회복(Level 1) 확인");
+  initializeFaultState();
+  syncAndInject(1, 1, 10);
+  testWaitForTimeout(5100);
+  requestAndVerifyLevel("Fault_Check", 2);
 
-testcase TC_PRE_01_NoDetection_When_EngineIsOff()
-{
-  testStep("1.0", "Setup: Engine=0, IGN=1, Batt=50%");
-  if (!setupAndClearFault("1.1", 0, 1, 50)) return;
-
-  testStep("2.0", "Check: Set Batt 15% and wait 5200 ms");
-  setBattPercent(15);
-  checkNoFaultForDuration("2.1", 5200, 20);
-}
-
-testcase TC_PRE_02_NoDetection_When_IgnitionIsOff()
-{
-  testStep("1.0", "Setup: Engine=1, IGN=0, Batt=50%");
-  if (!setupAndClearFault("1.1", 1, 0, 50)) return;
-
-  testStep("2.0", "Check: Set Batt 15% and wait 5200 ms");
-  setBattPercent(15);
-  checkNoFaultForDuration("2.1", 5200, 20);
-}
-
-testcase TC_DET_COND_01_NoFault_When_BattIs16()
-{
-  testStep("1.0", "Setup: Engine=1, IGN=1, Batt=50%");
-  if (!setupAndClearFault("1.1", 1, 1, 50)) return;
-
-  testStep("2.0", "Check: Set Batt 16% (Safe) and wait 5200 ms");
-  setBattPercent(16);
-  checkNoFaultForDuration("2.1", 5200, 20);
-}
-
-testcase TC_DET_COND_02_FaultDetected_When_BattIs15()
-{
-  testStep("1.0", "Setup: Engine=1, IGN=1, Batt=50%");
-  if (!setupAndClearFault("1.1", 1, 1, 50)) return;
-
-  testStep("2.0", "Action: Set Batt 15% (Fault) and wait 5200 ms");
-  setBattPercent(15);
-  testWaitForTimeout(5200);
-  
-  verifyCurrentPercentStatus("3.0", 2);
-}
-
-testcase TC_DET_TIM_01_NoFaultBefore4890ms_When_BattIs15()
-{
-  testStep("1.0", "Setup: Engine=1, IGN=1, Batt=50%");
-  if (!setupAndClearFault("1.1", 1, 1, 50)) return;
-
-  testStep("2.0", "Check: Wait 4890 ms (Under limit)");
-  setBattPercent(15);
-  checkStatusNotChangedAtTime("2.1", 4890, 2);
-}
-
-testcase TC_DET_TIM_02_FaultWithin4900To5100ms_When_BattIs15()
-{
-  long detectMs;
-  testStep("1.0", "Setup: Engine=1, IGN=1, Batt=50%");
-  if (!setupAndClearFault("1.1", 1, 1, 50)) return;
-
-  testStep("2.0", "Measure: Time to reach Level 2");
-  detectMs = measureTimeAfterPercentChange(15, 2, 5300, 10);
-  
-  checkTimeLimit("3.0", detectMs, 4900, 5100);
-  verifyCurrentPercentStatus("3.1", 2);
-}
-
-testcase TC_REC_COND_01_NoRecovery_When_BattIs29()
-{
-  testStep("1.0", "Action: Create Fault Level 2");
-  if (!setupAndClearFault("1.1", 1, 1, 10)) return;
-  testWaitForTimeout(5200);
-  if (!verifyCurrentPercentStatus("1.2", 2)) return;
-
-  testStep("2.0", "Check: Set Batt 29% (No recovery) and wait 120 ms");
-  setBattPercent(29);
+  syncAndInject(1, 1, 30);
   testWaitForTimeout(120);
-  
-  verifyCurrentPercentStatus("2.1", 2);
+  requestAndVerifyLevel("Recovery_Check", 1);
 }
 
-testcase TC_REC_COND_02_Recovery_When_BattIs30()
-{
-  testStep("1.0", "Action: Create Fault Level 2");
-  if (!setupAndClearFault("1.1", 1, 1, 10)) return;
-  testWaitForTimeout(5200);
-  if (!verifyCurrentPercentStatus("1.2", 2)) return;
+// --- 5. 회복 시간 경계값 (Recovery Timing) ---
+testcase TC_REC_TIM_01() {
+  testCaseTitle("REC_TIM_01", "회복시간: 90ms 이전 미회복 확인");
+  initializeFaultState();
+  syncAndInject(1, 1, 10);
+  testWaitForTimeout(5100);
+  requestAndVerifyLevel("Fault_Check", 2);
 
-  testStep("2.0", "Action: Set Batt 30% (Recover) and wait 120 ms");
-  setBattPercent(30);
-  testWaitForTimeout(120);
-
-  verifyCurrentPercentStatus("2.1", 1);
+  syncAndInject(1, 1, 30);
+  testWaitForTimeout(80);
+  requestAndVerifyLevel("Recovery_Check", 2);
 }
 
-testcase TC_REC_TIM_01_NoRecoveryBefore89ms_When_BattIs30()
-{
-  testStep("1.0", "Action: Create Fault Level 2");
-  if (!setupAndClearFault("1.1", 1, 1, 10)) return;
-  testWaitForTimeout(5200);
-  if (!verifyCurrentPercentStatus("1.2", 2)) return;
+testcase TC_REC_TIM_02() {
+  testCaseTitle("REC_TIM_02", "회복시간: 110ms 시점 회복 확인");
+  initializeFaultState();
+  syncAndInject(1, 1, 10);
+  testWaitForTimeout(5100);
+  requestAndVerifyLevel("Fault_Check", 2);
 
-  testStep("2.0", "Check: Wait 89 ms (Under limit)");
-  setBattPercent(30);
-  checkStatusNotChangedAtTime("2.1", 89, 1);
-}
-
-testcase TC_REC_TIM_02_RecoveryWithin90To110ms_When_BattIs30()
-{
-  long recoverMs;
-  testStep("1.0", "Action: Create Fault Level 2");
-  if (!setupAndClearFault("1.1", 1, 1, 10)) return;
-  testWaitForTimeout(5200);
-  if (!verifyCurrentPercentStatus("1.2", 2)) return;
-
-  testStep("2.0", "Measure: Time to reach Level 1");
-  recoverMs = measureTimeAfterPercentChange(30, 1, 150, 10);
-  
-  checkTimeLimit("3.0", recoverMs, 90, 110);
-  verifyCurrentPercentStatus("3.1", 1);
+  syncAndInject(1, 1, 30);
+  testWaitForTimeout(110);
+  requestAndVerifyLevel("Recovery_Check", 1);
 }
 
 void mainTest()
 {
-  testModuleTitle("Battery Percent Low Validation Test");
+  testModuleTitle("Battery Percent Fault Full Baseline Refactoring");
+  
+  setupPreCondition(1, 1, 50); 
 
-  TC_PRE_01_NoDetection_When_EngineIsOff();
-  TC_PRE_02_NoDetection_When_IgnitionIsOff();
-
-  TC_DET_COND_01_NoFault_When_BattIs16();
-  TC_DET_COND_02_FaultDetected_When_BattIs15();
-  TC_DET_TIM_01_NoFaultBefore4890ms_When_BattIs15();
-  TC_DET_TIM_02_FaultWithin4900To5100ms_When_BattIs15();
-
-  TC_REC_COND_01_NoRecovery_When_BattIs29();
-  TC_REC_COND_02_Recovery_When_BattIs30();
-  TC_REC_TIM_01_NoRecoveryBefore89ms_When_BattIs30();
-  TC_REC_TIM_02_RecoveryWithin90To110ms_When_BattIs30();
+  // 순차적 테스트 실행
+  TC_PRE_01();
+  TC_PRE_02();
+  
+  TC_DET_COND_01();
+  TC_DET_BVA_15_Fault();
+  TC_DET_COND_02();
+  
+  TC_DET_TIM_01_LowerLimit();
+  TC_DET_TIM_02_UpperLimit();
+  
+  TC_REC_COND_01();
+  TC_REC_COND_02();
+  
+  TC_REC_TIM_01();
+  TC_REC_TIM_02();
 }
