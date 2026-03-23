@@ -1,0 +1,19 @@
+/*@!Encoding:65001*/
+variables
+{
+  message STR_01_10ms STR_msg;
+  msTimer Timer_10ms;
+}
+
+on timer Timer_10ms
+{
+  output(STR_msg);
+}
+
+on sysvar STR::Sys_Steering_angle { STR_msg.Steering_angle = @this; }
+
+on sysvar STR::Sys_STR_10ms_En
+{
+  if (@this == 1) setTimerCyclic(Timer_10ms, 10);
+  else cancelTimer(Timer_10ms);
+}
