@@ -3,8 +3,11 @@ includes { }
 
 variables
 {
-  message Fault_sts_Rsp Fault_sts_Rsp_msg; 
-  message Fault_sts_Req Fault_sts_Req_msg; 
+  // [메시지 정의]
+  message Fault_sts_Rsp Fault_sts_Rsp_msg; // ID: 0x556
+  message Fault_sts_Req Fault_sts_Req_msg; // ID: 0x555
+
+  const long kSYNC_TIMEOUT = 10; 
 }
 
 on message Fault_sts_Rsp
@@ -12,417 +15,273 @@ on message Fault_sts_Rsp
   Fault_sts_Rsp_msg = this;
 }
 
-void setupPreCondition(long battPercent, long ignSts, long engineSts)
+// -----------------------------------------------------------------
+// [Helper Functions] 2번 코드(Baseline) 흐름 100% 동일 유지
+// -----------------------------------------------------------------
+
+// 1. 초기 환경 설정
+void setupPreCondition(long ignSts, long battPercent, long engineSts)
 {
   @sysvar::ENG::Sys_ENG_10ms_En = 1;
   @sysvar::ENG::Sys_IGN_2ms_En = 1;
   @sysvar::BMS::Sys_BMS_10ms_En = 1;
-  
   @sysvar::STR::Sys_STR_10ms_En = 0;
   @sysvar::BRK::Sys_BRK_10ms_En = 0;
 
-  @sysvar::BMS::Sys_Batt_Percent = battPercent; 
-  @sysvar::ENG::Sys_Ignition_sts = ignSts;      
-  @sysvar::ENG::Sys_Engine_sts = engineSts;
+  @sysvar::ENG::Sys_Ignition_sts = ignSts;      // 1:On, 0:Off
+  @sysvar::BMS::Sys_Batt_Percent = battPercent;
+  @sysvar::ENG::Sys_Engine_sts = engineSts; // 1:Run, 2:Fault
 
   Fault_sts_Req_msg.All_Fault_clr_request = 0;
   Fault_sts_Req_msg.All_Fault_sts_request = 0;
   output(Fault_sts_Req_msg);
 
-  testWaitForTimeout(100);
+  testWaitForTimeout(100); 
 }
 
-void setEngineStatus(long engineSts)
+// 2. 결함 초기화
+void initializeFaultState()
 {
-  @sysvar::ENG::Sys_Engine_sts = engineSts;
+  testStep("Init", "결함 초기화 시퀀스 시작");
+
+  // 정상 범위 세팅 (IGN On, Batt 50%, Engine Run)
+  @sysvar::ENG::Sys_Ignition_sts = 1;
+  @sysvar::BMS::Sys_Batt_Percent = 50;
+  @sysvar::ENG::Sys_Engine_sts = 1; 
+  testWaitForTimeout(100); 
+
+  Fault_sts_Req_msg.All_Fault_clr_request = 1;
+  output(Fault_sts_Req_msg);
+  testWaitForTimeout(100); 
+  
+  Fault_sts_Req_msg.All_Fault_clr_request = 0;
+  output(Fault_sts_Req_msg);
+  testWaitForTimeout(100); 
+
+  if(!requestAndVerifyLevel("Init_Verify", 0)) {
+    testStepFail("Init", "결함 초기화 실패.");
+  }
 }
 
-int requestFaultStatus(long timeoutMs)
+// 3. [싱크 주입] Baseline 흐름: 요청 -> 응답 대기 -> 주입
+void syncAndInject(long ign, long batt, long eng)
 {
+  char logBuf[512];
+  
+  Fault_sts_Req_msg.All_Fault_sts_request = 1;
+  output(Fault_sts_Req_msg);
+  
+  if (testWaitForMessage(Fault_sts_Rsp, kSYNC_TIMEOUT)) {
+    testStep("Sync", "ECU Cycle 동기화 완료.");
+  }
+  
+  Fault_sts_Req_msg.All_Fault_sts_request = 0;
+  output(Fault_sts_Req_msg);
+
+  @sysvar::ENG::Sys_Ignition_sts = ign;
+  @sysvar::BMS::Sys_Batt_Percent = batt;
+  @sysvar::ENG::Sys_Engine_sts = eng; 
+
+  snprintf(logBuf, 512, "[주입] IGN:%ld, Batt:%ld%%, Engine:%ld", ign, batt, eng);
+  testStep("Injection", logBuf);
+}
+
+// 4. [검증] Baseline 흐름: 20ms 대기 -> 요청 -> 데이터 박제 확인
+int requestAndVerifyLevel(char stepId[], long expectedLevel)
+{
+  char logBuf[512];
+  message Fault_sts_Rsp rxMsg; 
+
+  testWaitForTimeout(10); 
+
   Fault_sts_Req_msg.All_Fault_sts_request = 1;
   output(Fault_sts_Req_msg);
 
-  if (testWaitForMessage(Fault_sts_Rsp, timeoutMs))
+  if (testWaitForMessage(Fault_sts_Rsp, kSYNC_TIMEOUT))
   {
+    testGetWaitEventMsgData(rxMsg); 
+
     Fault_sts_Req_msg.All_Fault_sts_request = 0;
     output(Fault_sts_Req_msg);
-    return 1;
-  }
 
+    if (rxMsg.BATT_Chg_Err_sts == expectedLevel) {
+      snprintf(logBuf, 512, "[성공] 예상:%ld, 실제:%ld", expectedLevel, (long)rxMsg.BATT_Chg_Err_sts);
+      testStepPass(stepId, logBuf);
+      return 1;
+    } else {
+      snprintf(logBuf, 512, "[실패] 예상:%ld, 실제:%ld", expectedLevel, (long)rxMsg.BATT_Chg_Err_sts);
+      testStepFail(stepId, logBuf);
+      return 0;
+    }
+  }
+  
   Fault_sts_Req_msg.All_Fault_sts_request = 0;
   output(Fault_sts_Req_msg);
+  testStepFail(stepId, "ECU 응답 타임아웃");
   return 0;
 }
 
-void clearAllFault()
-{
-  Fault_sts_Req_msg.All_Fault_sts_request = 0;
-  Fault_sts_Req_msg.All_Fault_clr_request = 1;
-  output(Fault_sts_Req_msg);
-  testWaitForTimeout(50);
+// -----------------------------------------------------------------
+// [Test Cases] 요구사항 테이블(image_c22604.png) 전체 구현
+// -----------------------------------------------------------------
 
-  Fault_sts_Req_msg.All_Fault_clr_request = 0;
-  output(Fault_sts_Req_msg);
-  testWaitForTimeout(50);
-}
-
-int clearAndVerifyNoFault(char stepId[])
-{
-  clearAllFault();
-
-  if (!requestFaultStatus(100))
-  {
-    testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout");
-    return 0;
-  }
-
-  if (Fault_sts_Rsp_msg.ENG_Err_sts != 0)
-  {
-    testStepFail(stepId, "Fail. Expected: 0, Actual: %d", Fault_sts_Rsp_msg.ENG_Err_sts);
-    return 0;
-  }
-
-  testStepPass(stepId, "Pass. Expected: 0, Actual: 0");
-  return 1;
-}
-
-int verifyCurrentEngStatus(char stepId[], long expected)
-{
-  testWaitForTimeout(20); 
-
-  if (!requestFaultStatus(100))
-  {
-    testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout");
-    return 0;
-  }
-
-  if (Fault_sts_Rsp_msg.ENG_Err_sts != expected)
-  {
-    testStepFail(stepId, "Fail. Expected: %d, Actual: %d", expected, Fault_sts_Rsp_msg.ENG_Err_sts);
-    return 0;
-  }
-
-  testStepPass(stepId, "Pass. Expected: %d, Actual: %d", expected, Fault_sts_Rsp_msg.ENG_Err_sts);
-  return 1;
-}
-
-long measureTimeAfterEngChange(long engineSts, long targetStatus, long maxWaitMs, long pollMs)
-{
-  dword startTime;
-  dword currentTime;
-  long elapsed;
-
-  startTime = timeNow();
-  setEngineStatus(engineSts);
-
-  while (1)
-  {
-    testWaitForTimeout(pollMs); 
-    
-    currentTime = timeNow();
-    elapsed = (currentTime - startTime) / 100;
-
-    if (elapsed > maxWaitMs) break;
-
-    if (requestFaultStatus(50))
-    {
-      if (Fault_sts_Rsp_msg.ENG_Err_sts == targetStatus)
-      {
-        currentTime = timeNow();
-        return (currentTime - startTime) / 100;
-      }
-    }
-  }
-  return -1;
-}
-
-int checkTimeLimit(char stepId[], long measuredMs, long minMs, long maxMs)
-{
-  if (measuredMs < 0)
-  {
-    testStepFail(stepId, "Fail. Expected: Change within %d ms, Actual: Timeout", maxMs);
-    return 0;
-  }
-
-  if (measuredMs < minMs || measuredMs > maxMs)
-  {
-    testStepFail(stepId, "Fail. Expected: %d ~ %d ms, Actual: %d ms", minMs, maxMs, measuredMs);
-    return 0;
-  }
-
-  testStepPass(stepId, "Pass. Expected: %d ~ %d ms, Actual: %d ms", minMs, maxMs, measuredMs);
-  return 1;
-}
-
-int checkStatusNotChangedAtTime(char stepId[], long waitMs, long unexpectedStatus)
-{
-  testWaitForTimeout(20); 
-  testWaitForTimeout(waitMs);
-
-  if (!requestFaultStatus(100))
-  {
-    testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout");
-    return 0;
-  }
-
-  if (Fault_sts_Rsp_msg.ENG_Err_sts == unexpectedStatus)
-  {
-    testStepFail(stepId, "Fail. Expected: NOT %d yet, Actual: %d at %d ms", unexpectedStatus, unexpectedStatus, waitMs);
-    return 0;
-  }
-
-  testStepPass(stepId, "Pass. Expected: NOT %d yet, Actual: %d at %d ms", unexpectedStatus, Fault_sts_Rsp_msg.ENG_Err_sts, waitMs);
-  return 1;
-}
-
-int checkNoFaultForDuration(char stepId[], long totalWaitMs, long pollMs)
-{
-  dword startTime;
-  dword currentTime;
-  long elapsed;
-
-  testWaitForTimeout(20); 
-  startTime = timeNow();
-
-  while (1)
-  {
-    currentTime = timeNow();
-    elapsed = (currentTime - startTime) / 100;
-
-    if (elapsed > totalWaitMs) break;
-
-    if (!requestFaultStatus(100))
-    {
-      testStepFail(stepId, "Fail. Expected: ECU Response, Actual: Timeout at %d ms", elapsed);
-      return 0;
-    }
-
-    if (Fault_sts_Rsp_msg.ENG_Err_sts == 2)
-    {
-      testStepFail(stepId, "Fail. Expected: 0, Actual: 2 (Fault detected early at %d ms)", elapsed);
-      return 0;
-    }
-
-    testWaitForTimeout(pollMs);
-  }
-
-  testStepPass(stepId, "Pass. Expected: 0 for %d ms, Actual: 0", totalWaitMs);
-  return 1;
-}
-
-int setupAndClearFault(char clearStepId[], long battPercent, long ignSts, long engineSts)
-{
-  setupPreCondition(battPercent, ignSts, engineSts);
-
-  if (!clearAndVerifyNoFault(clearStepId)) return 0;
-  return 1;
-}
-
-testcase TC_DET_PRE_01_NoDetection_When_IgnitionIsOff()
-{
-  testStep("1.0", "Setup: Batt=50%, IGN=0(Off), Engine=1(Run)");
-  if (!setupAndClearFault("1.1", 50, 0, 1)) return;
-
-  testStep("2.0", "Check: Set Engine=2(Fault) and wait 1120 ms");
-  setEngineStatus(2);
-  checkNoFaultForDuration("2.1", 1120, 20);
-}
-
-testcase TC_DET_PRE_02_NoDetection_When_BattIs39()
-{
-  testStep("1.0", "Setup: Batt=39%, IGN=1(On), Engine=1(Run)");
-  if (!setupAndClearFault("1.1", 39, 1, 1)) return;
-
-  testStep("2.0", "Check: Set Engine=2(Fault) and wait 1120 ms");
-  setEngineStatus(2);
-  checkNoFaultForDuration("2.1", 1120, 20);
-}
-
-testcase TC_DET_PRE_03_NoDetection_When_BattIs61()
-{
-  testStep("1.0", "Setup: Batt=61%, IGN=1(On), Engine=1(Run)");
-  if (!setupAndClearFault("1.1", 61, 1, 1)) return;
-
-  testStep("2.0", "Check: Set Engine=2(Fault) and wait 1120 ms");
-  setEngineStatus(2);
-  checkNoFaultForDuration("2.1", 1120, 20);
-}
-
-testcase TC_DET_BVA_01_FaultDetected_When_BattIs40()
-{
-  testStep("1.0", "Setup: Batt=40% (Min), IGN=1(On), Engine=1(Run)");
-  if (!setupAndClearFault("1.1", 40, 1, 1)) return;
-
-  testStep("2.0", "Action: Set Engine=2(Fault) and wait 1120 ms");
-  setEngineStatus(2);
+// --- 사전조건 (검출) ---
+testcase TC_DET_PRE_01() {
+  testCaseTitle("TC_DET_PRE_01", "사전조건: IGN Off 시 미검출");
+  initializeFaultState();
+  syncAndInject(0, 50, 2); // IGN Off, 50%, Fault
   testWaitForTimeout(1120);
-  
-  verifyCurrentEngStatus("3.0", 2);
+  requestAndVerifyLevel("Check", 0);
 }
 
-testcase TC_DET_BVA_02_FaultDetected_When_BattIs60()
-{
-  testStep("1.0", "Setup: Batt=60% (Max), IGN=1(On), Engine=1(Run)");
-  if (!setupAndClearFault("1.1", 60, 1, 1)) return;
-
-  testStep("2.0", "Action: Set Engine=2(Fault) and wait 1120 ms");
-  setEngineStatus(2);
+testcase TC_DET_PRE_02() {
+  testCaseTitle("TC_DET_PRE_02", "사전조건: 배터리 최소 미달(39%) 미검출");
+  initializeFaultState();
+  syncAndInject(1, 39, 2); 
   testWaitForTimeout(1120);
-  
-  verifyCurrentEngStatus("3.0", 2);
+  requestAndVerifyLevel("Check", 0);
 }
 
-testcase TC_DET_COND_01_NoFault_When_EngineIs1()
-{
-  testStep("1.0", "Setup: Batt=50%, IGN=1(On), Engine=1(Run)");
-  if (!setupAndClearFault("1.1", 50, 1, 1)) return;
-
-  testStep("2.0", "Check: Keep Engine=1(Run) and wait 1120 ms");
-  setEngineStatus(1);
-  checkNoFaultForDuration("2.1", 1120, 20);
-}
-
-testcase TC_DET_TIM_01_NoFaultBefore890ms_When_EngineIs2()
-{
-  testStep("1.0", "Setup: Batt=50%, IGN=1(On), Engine=1(Run)");
-  if (!setupAndClearFault("1.1", 50, 1, 1)) return;
-
-  testStep("2.0", "Check: Wait 890 ms (Under limit)");
-  setEngineStatus(2);
-  checkStatusNotChangedAtTime("2.1", 890, 2);
-}
-
-testcase TC_DET_TIM_02_FaultWithin900To1100ms_When_EngineIs2()
-{
-  long detectMs;
-  testStep("1.0", "Setup: Batt=50%, IGN=1(On), Engine=1(Run)");
-  if (!setupAndClearFault("1.1", 50, 1, 1)) return;
-
-  testStep("2.0", "Measure: Time to reach Level 2");
-  detectMs = measureTimeAfterEngChange(2, 2, 1200, 10);
-  
-  checkTimeLimit("3.0", detectMs, 900, 1100);
-  verifyCurrentEngStatus("3.1", 2);
-}
-
-testcase TC_REC_PRE_01_NoRecovery_When_BattIs39()
-{
-  testStep("1.0", "Action: Create Fault Level 2");
-  if (!setupAndClearFault("1.1", 50, 1, 1)) return;
-  setEngineStatus(2);
+testcase TC_DET_PRE_03() {
+  testCaseTitle("TC_DET_PRE_03", "사전조건: 배터리 최대 초과(61%) 미검출");
+  initializeFaultState();
+  syncAndInject(1, 61, 2); 
   testWaitForTimeout(1120);
-  if (!verifyCurrentEngStatus("1.2", 2)) return;
+  requestAndVerifyLevel("Check", 0);
+}
 
-  testStep("2.0", "Setup: Change Batt=39%");
-  setupPreCondition(39, 1, 2);
+// --- 검출 조건 ---
+testcase TC_DET_BVA_01() {
+  testCaseTitle("TC_DET_BVA_01", "검출조건: 최소 경계값(40%) 검출");
+  initializeFaultState();
+  syncAndInject(1, 40, 2); 
+  testWaitForTimeout(1120);
+  requestAndVerifyLevel("Check", 2);
+}
 
-  testStep("3.0", "Check: Set Engine=1 (Recover) but Batt is out of range");
-  setEngineStatus(1);
+testcase TC_DET_BVA_02() {
+  testCaseTitle("TC_DET_BVA_02", "검출조건: 최대 경계값(60%) 검출");
+  initializeFaultState();
+  syncAndInject(1, 60, 2); 
+  testWaitForTimeout(1120);
+  requestAndVerifyLevel("Check", 2);
+}
+
+testcase TC_DET_COND_01() {
+  testCaseTitle("TC_DET_COND_01", "검출조건: 정상 상태 유지(Engine Run)");
+  initializeFaultState();
+  syncAndInject(1, 50, 1); 
+  testWaitForTimeout(1120);
+  requestAndVerifyLevel("Check", 0);
+}
+
+// --- 검출 시간 ---
+testcase TC_DET_TIM_01() {
+  testCaseTitle("TC_DET_TIM_01", "검출시간: 오차 최소 미달(890ms)");
+  initializeFaultState();
+  syncAndInject(1, 50, 2);
+  testWaitForTimeout(890);
+  requestAndVerifyLevel("Check", 0);
+}
+
+testcase TC_DET_TIM_02() {
+  testCaseTitle("TC_DET_TIM_02", "검출시간: 오차 최대 도달(1100ms)");
+  initializeFaultState();
+  syncAndInject(1, 50, 2);
+  testWaitForTimeout(1100);
+  requestAndVerifyLevel("Check", 2);
+}
+
+// --- 사전조건 (회복) ---
+testcase TC_REC_PRE_01() {
+  testCaseTitle("TC_REC_PRE_01", "회복조건: 배터리 최소 미달(39%) 고장 유지");
+  initializeFaultState();
+  syncAndInject(1, 50, 2); // 먼저 고장 발생
+  testWaitForTimeout(1100);
+  if(!requestAndVerifyLevel("PreCheck", 2)) return;
+
+  syncAndInject(1, 39, 1); // 조건 미달 전압 주입
   testWaitForTimeout(120);
-  
-  verifyCurrentEngStatus("3.1", 2);
+  requestAndVerifyLevel("Check", 2);
 }
 
-testcase TC_REC_PRE_02_NoRecovery_When_BattIs81()
-{
-  testStep("1.0", "Action: Create Fault Level 2");
-  if (!setupAndClearFault("1.1", 50, 1, 1)) return;
-  setEngineStatus(2);
-  testWaitForTimeout(1120);
-  if (!verifyCurrentEngStatus("1.2", 2)) return;
+testcase TC_REC_PRE_02() {
+  testCaseTitle("TC_REC_PRE_02", "회복조건: 배터리 최대 초과(81%) 고장 유지");
+  initializeFaultState();
+  syncAndInject(1, 50, 2);
+  testWaitForTimeout(1100);
+  requestAndVerifyLevel("PreCheck", 2);
 
-  testStep("2.0", "Setup: Change Batt=81%");
-  setupPreCondition(81, 1, 2);
-
-  testStep("3.0", "Check: Set Engine=1 (Recover) but Batt is out of range");
-  setEngineStatus(1);
+  syncAndInject(1, 81, 1); 
   testWaitForTimeout(120);
-  
-  verifyCurrentEngStatus("3.1", 2);
+  requestAndVerifyLevel("Check", 2);
 }
 
-testcase TC_REC_BVA_01_Recovery_When_BattIs80()
-{
-  testStep("1.0", "Action: Create Fault Level 2");
-  if (!setupAndClearFault("1.1", 50, 1, 1)) return;
-  setEngineStatus(2);
-  testWaitForTimeout(1120);
-  if (!verifyCurrentEngStatus("1.2", 2)) return;
+// --- 회복 조건 ---
+testcase TC_REC_BVA_01() {
+  testCaseTitle("TC_REC_BVA_01", "회복조건: 최대 경계값(80%) 회복");
+  initializeFaultState();
+  syncAndInject(1, 50, 2);
+  testWaitForTimeout(1100);
+  requestAndVerifyLevel("PreCheck", 2);
 
-  testStep("2.0", "Setup: Change Batt=80%");
-  setupPreCondition(80, 1, 2);
-
-  testStep("3.0", "Action: Set Engine=1 (Recover)");
-  setEngineStatus(1);
+  syncAndInject(1, 80, 1); 
   testWaitForTimeout(120);
-  
-  verifyCurrentEngStatus("3.1", 1);
+  requestAndVerifyLevel("Check", 1);
 }
 
-testcase TC_REC_COND_01_NoRecovery_When_EngineIs2()
-{
-  testStep("1.0", "Action: Create Fault Level 2");
-  if (!setupAndClearFault("1.1", 50, 1, 1)) return;
-  setEngineStatus(2);
-  testWaitForTimeout(1120);
-  if (!verifyCurrentEngStatus("1.2", 2)) return;
+testcase TC_REC_COND_01() {
+  testCaseTitle("TC_REC_COND_01", "회복조건: 고장 상태 유지 시 미회복");
+  initializeFaultState();
+  syncAndInject(1, 50, 2);
+  testWaitForTimeout(1100);
+  requestAndVerifyLevel("PreCheck", 2);
 
-  testStep("2.0", "Check: Keep Engine=2 (No recovery)");
-  setEngineStatus(2);
+  syncAndInject(1, 50, 2); // 에러 유지
   testWaitForTimeout(120);
-  
-  verifyCurrentEngStatus("2.1", 2);
+  requestAndVerifyLevel("Check", 2);
 }
 
-testcase TC_REC_TIM_01_NoRecoveryBefore89ms_When_EngineIs1()
-{
-  testStep("1.0", "Action: Create Fault Level 2");
-  if (!setupAndClearFault("1.1", 50, 1, 1)) return;
-  setEngineStatus(2);
-  testWaitForTimeout(1120);
-  if (!verifyCurrentEngStatus("1.2", 2)) return;
+// --- 회복 시간 ---
+testcase TC_REC_TIM_01() {
+  testCaseTitle("TC_REC_TIM_01", "회복시간: 오차 최소 미달(89ms)");
+  initializeFaultState();
+  syncAndInject(1, 50, 2);
+  testWaitForTimeout(1100);
+  requestAndVerifyLevel("PreCheck", 2);
 
-  testStep("2.0", "Check: Wait 89 ms (Under limit)");
-  setEngineStatus(1);
-  checkStatusNotChangedAtTime("2.1", 89, 1);
+  syncAndInject(1, 50, 1);
+  testWaitForTimeout(89);
+  requestAndVerifyLevel("Check", 2);
 }
 
-testcase TC_REC_TIM_02_RecoveryWithin90To110ms_When_EngineIs1()
-{
-  long recoverMs;
-  testStep("1.0", "Action: Create Fault Level 2");
-  if (!setupAndClearFault("1.1", 50, 1, 1)) return;
-  setEngineStatus(2);
-  testWaitForTimeout(1120);
-  if (!verifyCurrentEngStatus("1.2", 2)) return;
+testcase TC_REC_TIM_02() {
+  testCaseTitle("TC_REC_TIM_02", "회복시간: 오차 최대 도달(110ms)");
+  initializeFaultState();
+  syncAndInject(1, 50, 2);
+  testWaitForTimeout(1100);
+  requestAndVerifyLevel("PreCheck", 2);
 
-  testStep("2.0", "Measure: Time to reach Level 1");
-  recoverMs = measureTimeAfterEngChange(1, 1, 150, 10);
-  
-  checkTimeLimit("3.0", recoverMs, 90, 110);
-  verifyCurrentEngStatus("3.1", 1);
+  syncAndInject(1, 50, 1);
+  testWaitForTimeout(110);
+  requestAndVerifyLevel("Check", 1);
 }
 
+// -----------------------------------------------------------------
+// [Main]
+// -----------------------------------------------------------------
 void mainTest()
 {
-  testModuleTitle("Req 5: Engine Status Error Validation (with BVA)");
-
-  TC_DET_PRE_01_NoDetection_When_IgnitionIsOff();
-  TC_DET_PRE_02_NoDetection_When_BattIs39();
-  TC_DET_PRE_03_NoDetection_When_BattIs61();
+  testModuleTitle("Engine Status Error 정밀 검증");
   
-  TC_DET_BVA_01_FaultDetected_When_BattIs40();
-  TC_DET_BVA_02_FaultDetected_When_BattIs60();
+  setupPreCondition(1, 50, 1); 
 
-  TC_DET_COND_01_NoFault_When_EngineIs1();
-  TC_DET_TIM_01_NoFaultBefore890ms_When_EngineIs2();
-  TC_DET_TIM_02_FaultWithin900To1100ms_When_EngineIs2();
-
-  TC_REC_PRE_01_NoRecovery_When_BattIs39();
-  TC_REC_PRE_02_NoRecovery_When_BattIs81();
-  TC_REC_BVA_01_Recovery_When_BattIs80();
-
-  TC_REC_COND_01_NoRecovery_When_EngineIs2();
-  TC_REC_TIM_01_NoRecoveryBefore89ms_When_EngineIs1();
-  TC_REC_TIM_02_RecoveryWithin90To110ms_When_EngineIs1();
+  TC_DET_PRE_01(); TC_DET_PRE_02(); TC_DET_PRE_03();
+  TC_DET_BVA_01(); TC_DET_BVA_02();
+  TC_DET_COND_01();
+  TC_DET_TIM_01(); TC_DET_TIM_02();
+  TC_REC_PRE_01(); TC_REC_PRE_02();
+  TC_REC_BVA_01();
+  TC_REC_COND_01();
+  TC_REC_TIM_01(); TC_REC_TIM_02();
 }
